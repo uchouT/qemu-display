@@ -1,6 +1,6 @@
 use qemu_display::{Console, Display, MouseButton};
 
-use ironrdp::server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task,

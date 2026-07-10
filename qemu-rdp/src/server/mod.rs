@@ -1,12 +1,12 @@
 use anyhow::{bail, Error};
 use enumflags2::BitFlags;
-use ironrdp::server::{Credentials, ServerEvent, TlsIdentityCtx};
+use ironrdp_server::{Credentials, ServerEvent, TlsIdentityCtx};
 use std::path::PathBuf;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error};
 use zbus::object_server::SignalEmitter;
 
-use ironrdp::server::RdpServer;
+use ironrdp_server::RdpServer;
 use qemu_display::{zbus, Display};
 
 mod clipboard;

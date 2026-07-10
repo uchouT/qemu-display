@@ -223,7 +223,7 @@ mod tests {
     use std::num::NonZero;
 
     use bytes::Bytes;
-    use ironrdp::server::{DesktopSize, PixelFormat};
+    use ironrdp_server::{DesktopSize, PixelFormat};
 
     use super::*;
 

@@ -6,7 +6,10 @@ use std::{
 use anyhow::Result;
 // use tracing::{debug, error, warn};
 use ironrdp::{
-    rdpsnd::pdu::{self, AudioFormatFlags},
+    rdpsnd::{
+        pdu,
+        server::{NegotiatedFormat, RdpsndError},
+    },
     server::{
         RdpsndServerHandler, RdpsndServerMessage, ServerEvent, ServerEventSender,
         SoundServerFactory,
@@ -30,7 +33,6 @@ pub struct Inner {
     start_time: Instant,
     ev_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     client_fmt: Option<pdu::AudioFormat>,
-    client_flags: Option<pdu::AudioFormatFlags>,
     volume: Option<Volume>,
     opus_enc: opus::Encoder,
     _audio: Option<Audio>,
@@ -108,10 +110,7 @@ impl AudioOutHandler for DBusHandler {
         let mut inner = self.inner.lock().unwrap();
         inner.volume = Some(volume.clone());
 
-        let Some(client_flags) = inner.client_flags else {
-            return;
-        };
-        if !client_flags.contains(AudioFormatFlags::VOLUME) {
+        if inner.client_fmt.is_none() {
             return;
         }
 
@@ -197,17 +196,6 @@ pub(crate) struct RDPSndHandler {
     inner: Arc<Mutex<Inner>>,
 }
 
-impl RDPSndHandler {
-    fn choose_format(&self, client_formats: &[pdu::AudioFormat]) -> Option<u16> {
-        for (n, fmt) in client_formats.iter().enumerate() {
-            if self.get_formats().contains(fmt) {
-                return u16::try_from(n).ok();
-            }
-        }
-        None
-    }
-}
-
 const OPUS_48K: pdu::AudioFormat = pdu::AudioFormat {
     format: pdu::WaveFormat::OPUS,
     n_channels: 2,
@@ -242,17 +230,15 @@ impl RdpsndServerHandler for RDPSndHandler {
         &[PCM_48K]
     }
 
-    fn start(&mut self, client_format: &pdu::ClientAudioFormatPdu) -> Option<u16> {
-        let fmt = self.choose_format(&client_format.formats);
-        if let Some(n) = fmt {
-            let mut inner = self.inner.lock().unwrap();
-            inner.client_fmt = Some(client_format.formats[usize::from(n)].clone());
-            inner.client_flags = Some(client_format.flags);
-            debug!(?inner.client_fmt);
-        } else {
-            warn!("No compatible audio format!");
-        }
-        fmt
+    fn choose_format<'a>(&mut self, common: &'a [NegotiatedFormat]) -> Option<&'a NegotiatedFormat> {
+        common.first()
+    }
+
+    fn start(&mut self, format: &NegotiatedFormat) -> std::result::Result<(), Box<dyn RdpsndError>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.client_fmt = Some(format.format().clone());
+        debug!(?inner.client_fmt);
+        Ok(())
     }
 
     fn stop(&mut self) {
@@ -280,7 +266,6 @@ impl SoundHandler {
             state: State::Init,
             ev_sender: None,
             client_fmt: None,
-            client_flags: None,
             volume: None,
             opus_enc: opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio)?,
             _audio: None,
