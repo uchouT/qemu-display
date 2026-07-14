@@ -13,6 +13,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::server::usbredir::redir_task::RedirTask;
 
+mod proto;
 mod redir_task;
 
 pub struct QemuUsbFactory {
@@ -46,10 +47,13 @@ struct RdpUsbRedirDeviceBackend {
     sender: Option<UnboundedSender<RedirEvent>>,
 }
 
-
-#[derive(PartialEq, Debug)]
+#[derive(Debug)]
 enum RedirEvent {
     Ready,
+    TransferInCompleted {
+        request_id: RequestId,
+        completion: TransferInCompletionResult,
+    },
 }
 
 impl RdpUsbRedirDeviceBackend {
@@ -102,11 +106,17 @@ impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
 
     fn transfer_in_completed(
         &mut self,
-        channel_id: u32,
+        _channel_id: u32,
         request_id: RequestId,
         completion: TransferInCompletionResult,
     ) -> ironrdp::pdu::PduResult<()> {
-        todo!("check the data, send to qemu unix stream")
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(RedirEvent::TransferInCompleted {
+                request_id,
+                completion,
+            });
+        }
+        Ok(())
     }
 
     fn transfer_out_completed(
@@ -125,7 +135,7 @@ struct RdpUsb;
 #[async_trait::async_trait]
 impl qemu_display::UsbRedirBackend for RdpUsb {
     type SessionInput = RdpUsbRedirDevice;
-    type Key = DeviceKey;
+    type Key = String;
     type Session = RdpUsbSession;
     async fn start_session(
         &self,
@@ -141,15 +151,23 @@ impl qemu_display::UsbRedirBackend for RdpUsb {
 }
 
 struct RdpUsbRedirDevice {
+    data: redir_task::DeviceData,
     rdp_handle: UsbDeviceHandle,
-    rx: UnboundedReceiver<RedirEvent>
+    rx: UnboundedReceiver<RedirEvent>,
 }
 
-#[derive(Hash, PartialEq, Eq)]
-struct DeviceKey(u32);
-impl From<&RdpUsbRedirDevice> for DeviceKey {
-    fn from(value: &RdpUsbRedirDevice) -> Self {
-        todo!()
+impl RdpUsbRedirDevice {
+    fn new(
+        data: redir_task::DeviceData,
+        rdp_handle: UsbDeviceHandle,
+        rx: UnboundedReceiver<RedirEvent>,
+    ) -> Self {
+        Self {
+            data,
+            rdp_handle,
+            rx,
+        }
     }
 }
+
 struct RdpUsbSession;
