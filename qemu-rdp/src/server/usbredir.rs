@@ -15,6 +15,7 @@ use crate::server::usbredir::redir_task::RedirTask;
 
 mod proto;
 mod redir_task;
+mod session_task;
 
 pub struct QemuUsbFactory {
     usbredir: UsbRedir<RdpUsb>,
@@ -49,7 +50,6 @@ struct RdpUsbRedirDeviceBackend {
 
 #[derive(Debug)]
 enum RedirEvent {
-    Ready,
     TransferInCompleted {
         request_id: RequestId,
         completion: TransferInCompletionResult,
@@ -142,11 +142,7 @@ impl qemu_display::UsbRedirBackend for RdpUsb {
         input: Self::SessionInput,
         stream: UnixStream,
     ) -> qemu_display::Result<Self::Session> {
-        todo!(
-            "
-            read and write stream, dispatch by Self::Device
-            "
-        )
+        RdpUsbSession::new(input, stream).await
     }
 }
 
@@ -170,4 +166,30 @@ impl RdpUsbRedirDevice {
     }
 }
 
-struct RdpUsbSession;
+struct RdpUsbSession {
+    task: tokio::task::JoinHandle<()>,
+    handle: UsbDeviceHandle,
+}
+
+impl RdpUsbSession {
+    async fn new(device: RdpUsbRedirDevice, stream: UnixStream) -> qemu_display::Result<Self> {
+        let handle = device.rdp_handle.clone();
+        let task = session_task::SessionTask::new(device, stream)?;
+        let task = tokio::spawn(async move {
+            if let Err(error) = task.run().await {
+                tracing::error!(%error, "USB redirection session failed");
+            }
+        });
+
+        Ok(Self { task, handle })
+    }
+}
+
+impl Drop for RdpUsbSession {
+    fn drop(&mut self) {
+        // TODO: handle session close
+        //
+        // let _ = self.handle.retract_request(reason);
+        self.task.abort();
+    }
+}

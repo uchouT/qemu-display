@@ -24,10 +24,14 @@ pub(super) struct RedirTask {
 /// Ref: usbredir protocol v0.7, `usb_redir_device_connect`: send `ep_info`,
 /// then `interface_info`, and only then `device_connect`.
 pub(super) struct DeviceData {
+    pub(super) device: DeviceAnnouncement,
+    pub(super) configuration: u8,
+}
+
+pub(super) struct DeviceAnnouncement {
     pub(super) device_connect: DeviceConnectInfo,
     pub(super) interface_info: InterfaceInfoData,
     pub(super) ep_info: EpInfoData,
-    pub(super) configuration: u8,
 }
 
 impl RedirTask {
@@ -84,8 +88,9 @@ impl RedirTask {
         // TODO: RDPEUSB exposes only the Full/High distinction; bcdUSB alone
         // does not prove SuperSpeed.
         let speed = match announce.usb_device_caps.device_speed {
-            DeviceSpeed::HighSpeed => Speed::High,
-            DeviceSpeed::FullSpeed => Speed::Full,
+            DeviceSpeed::HIGH_SPEED => Speed::High,
+            DeviceSpeed::FULL_SPEED => Speed::Full,
+            _ => Speed::Unknown,
         };
         let (interface_info, ep_info) = descriptor::usbredir_config_info(
             &device_descriptor,
@@ -96,17 +101,19 @@ impl RedirTask {
 
         Ok(DeviceData {
             // Ref: usbredir protocol v0.7, `usb_redir_device_connect`.
-            device_connect: DeviceConnectInfo {
-                speed,
-                device_class: device_descriptor.device_class,
-                device_subclass: device_descriptor.device_subclass,
-                device_protocol: device_descriptor.device_protocol,
-                vendor_id: device_descriptor.vendor_id,
-                product_id: device_descriptor.product_id,
-                device_version_bcd: device_descriptor.device_version,
+            device: DeviceAnnouncement {
+                device_connect: DeviceConnectInfo {
+                    speed,
+                    device_class: device_descriptor.device_class,
+                    device_subclass: device_descriptor.device_subclass,
+                    device_protocol: device_descriptor.device_protocol,
+                    vendor_id: device_descriptor.vendor_id,
+                    product_id: device_descriptor.product_id,
+                    device_version_bcd: device_descriptor.device_version,
+                },
+                interface_info,
+                ep_info,
             },
-            interface_info,
-            ep_info,
             configuration,
         })
     }
@@ -244,24 +251,14 @@ impl RedirTask {
         let key = announce.device_instance_id.clone();
 
         // communicate with RDP client to get enough data for creating device via usbredir.
-        let device_data = loop {
-            let event = self
-                .rx
-                .recv()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("session dropped"))?;
-
-            // TODO: ironrdp processor receives REGISTER_REQUEST_CALLBACK should emit a callback
-            if !matches!(event, RedirEvent::Ready) {
-                tracing::debug!("received {event:?} while booting");
-                continue;
-            }
-            break self.bootstrap(announce).await?;
-        };
+        let device_data = self.bootstrap(announce).await?;
+        tracing::debug!(%key, "RDPEUSB device bootstrap completed");
 
         let device = RdpUsbRedirDevice::new(device_data, self.rdp_handle, self.rx);
 
-        self.usbredir.connect_device(key, device).await?;
+        tracing::debug!(%key, "connecting RDPEUSB device to QEMU usbredir chardev");
+        let connected = self.usbredir.connect_device(key.clone(), device).await?;
+        tracing::debug!(%key, connected, "QEMU usbredir device connection completed");
         Ok(())
     }
 }
