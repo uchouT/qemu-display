@@ -3,7 +3,7 @@ use crate::win32::Fd;
 use std::convert::TryFrom;
 #[cfg(unix)]
 use zbus::zvariant::Fd;
-use zbus::zvariant::ObjectPath;
+use zbus::{proxy::CacheProperties, zvariant::ObjectPath};
 
 use crate::Result;
 
@@ -40,7 +40,14 @@ pub struct Chardev {
 impl Chardev {
     pub async fn new(conn: &zbus::Connection, id: &str) -> Result<Self> {
         let obj_path = ObjectPath::try_from(format!("/org/qemu/Display1/Chardev_{id}"))?;
-        let proxy = ChardevProxy::builder(conn).path(&obj_path)?.build().await?;
+        // Owner changes when streams are registered or closed. QEMU may publish
+        // that change after Register returns, so a zbus property cache can
+        // briefly report the previous owner and select an occupied chardev.
+        let proxy = ChardevProxy::builder(conn)
+            .path(&obj_path)?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?;
         Ok(Self { proxy })
     }
 }
