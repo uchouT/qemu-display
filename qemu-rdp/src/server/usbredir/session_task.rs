@@ -30,7 +30,9 @@ impl SessionTask {
         let parser = Parser::new(
             ParserConfig::new(concat!("qemu-rdp ", env!("CARGO_PKG_VERSION")))
                 .cap(Cap::ConnectDeviceVersion)
-                .cap(Cap::EpInfoMaxPacketSize),
+                .cap(Cap::EpInfoMaxPacketSize)
+                .cap(Cap::Ids64Bits)
+                .cap(Cap::BulkLength32Bits),
         );
 
         Ok(Self {
@@ -43,7 +45,9 @@ impl SessionTask {
     }
 
     pub(super) async fn run(mut self) -> anyhow::Result<()> {
-        self.hello().await?;
+        tracing::debug!("QEMU usbredir session task started");
+        let written = self.flush_output().await?;
+        tracing::debug!(written, "sent local usbredir Hello");
 
         let mut buffer = vec![0; READ_BUFFER_SIZE];
         loop {
@@ -55,6 +59,7 @@ impl SessionTask {
                         return Ok(());
                     }
 
+                    tracing::trace!(read, "received bytes from QEMU usbredir chardev");
                     self.parser
                         .feed(&buffer[..read])
                         .context("parse QEMU usbredir data")?;
@@ -74,7 +79,10 @@ impl SessionTask {
                 }
             }
 
-            self.hello().await?;
+            let written = self.flush_output().await?;
+            if written != 0 {
+                tracing::debug!(written, "sent queued usbredir packets to QEMU");
+            }
         }
     }
 
@@ -82,7 +90,10 @@ impl SessionTask {
         while let Some(event) = self.parser.poll() {
             match event {
                 Event::Packet(packet) => match *packet {
-                    Packet::Hello { .. } => self.announce_device()?,
+                    Packet::Hello { version, caps } => {
+                        tracing::debug!(%version, ?caps, "received QEMU usbredir Hello");
+                        self.announce_device()?;
+                    }
                     packet => self.bridge.handle_usbredir_packet(packet).await?,
                 },
                 Event::Error(error) => return Err(error).context("decode usbredir packet"),
@@ -108,18 +119,21 @@ impl SessionTask {
         self.parser
             .send(&Packet::device_connect(announcement.device_connect))
             .context("encode usbredir device connection")?;
+        tracing::debug!("queued usbredir EpInfo, InterfaceInfo, and DeviceConnect announcements");
 
         Ok(())
     }
 
-    async fn hello(&mut self) -> anyhow::Result<()> {
+    async fn flush_output(&mut self) -> anyhow::Result<usize> {
+        let mut written = 0;
         while let Some(bytes) = self.parser.drain() {
             self.stream
                 .write_all(&bytes)
                 .await
                 .context("write QEMU usbredir chardev")?;
+            written += bytes.len();
         }
 
-        Ok(())
+        Ok(written)
     }
 }

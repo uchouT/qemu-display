@@ -24,13 +24,13 @@ impl Bridge {
 
     pub(super) async fn handle_usbredir_packet(&mut self, packet: Packet) -> anyhow::Result<()> {
         // TODO: usbredir <-> rdpeusb translation
-        tracing::debug!(?packet, "usbredir packet is awaiting RDPEUSB translation");
+        tracing::error!(?packet, "usbredir packet is awaiting RDPEUSB translation");
         Ok(())
     }
 
     pub(super) fn handle_rdp_event(&mut self, event: RedirEvent) -> anyhow::Result<Option<Packet>> {
         // TODO: usbredir <-> rdpeusb translation
-        tracing::debug!(?event, "RDPEUSB event is awaiting usbredir translation");
+        tracing::error!(?event, "RDPEUSB event is awaiting usbredir translation");
         Ok(None)
     }
 }

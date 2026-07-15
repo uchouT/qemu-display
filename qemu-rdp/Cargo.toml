@@ -26,7 +26,7 @@ tokio = { version = "1.39", features = ["full"] }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "cargo"] }
 async-trait = "0.1"
-ironrdp = { path = "../../IronRDP/crates/ironrdp", features = [
+ironrdp = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/urbdrc", features = [
     "connector",
     "server",
     "svc",
@@ -35,8 +35,8 @@ ironrdp = { path = "../../IronRDP/crates/ironrdp", features = [
     "rdpsnd",
     "qoiz",
 ] }
-ironrdp-server = { git = "https://github.com/uchouT/IronRDP.git", branch = "ironrdp-server", features = ["helper", "usb"] }
-ironrdp-rdpeusb = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/rdpeusb-lenient-caps" }
+ironrdp-server = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/urbdrc", features = ["helper", "usb"] }
+ironrdp-rdpeusb = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/urbdrc" }
 usbredir-proto = { git = "https://github.com/elmarco/usbredir-proto.git" }
 futures-util = "0.3"
 zbus.workspace = true

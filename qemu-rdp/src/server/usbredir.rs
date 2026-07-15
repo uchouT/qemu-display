@@ -24,6 +24,10 @@ pub struct QemuUsbFactory {
 impl QemuUsbFactory {
     pub async fn connect(display: &qemu_display::Display<'_>) -> anyhow::Result<Self> {
         let chardevs = display.usbredir_chardevs().await;
+        tracing::debug!(
+            chardev_count = chardevs.len(),
+            "discovered QEMU usbredir chardevs"
+        );
         Ok(Self {
             usbredir: UsbRedir::new(chardevs, RdpUsb),
         })
@@ -69,8 +73,13 @@ impl RdpUsbRedirDeviceBackend {
 impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
     fn add_device(&mut self, device: DeviceAnnounce) -> ironrdp::pdu::PduResult<()> {
         if self.sender.is_some() {
+            tracing::debug!("ignoring duplicate RDPEUSB device announcement");
             return Ok(());
         }
+        tracing::debug!(
+            device_instance_id = %device.device_instance_id,
+            "starting RDPEUSB device bootstrap"
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.sender = Some(tx);
         let task = RedirTask::new(self.usbredir.clone(), self.rdp_handle.clone(), rx);
