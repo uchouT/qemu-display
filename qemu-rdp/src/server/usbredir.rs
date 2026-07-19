@@ -11,10 +11,8 @@ use ironrdp_server::{DeviceFactory, UsbDeviceHandle};
 use qemu_display::UsbRedir;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::server::usbredir::redir_task::RedirTask;
-
 mod proto;
-mod redir_task;
+mod rdpeusb_io;
 mod session_task;
 
 pub struct QemuUsbFactory {
@@ -70,6 +68,36 @@ impl RdpUsbRedirDeviceBackend {
     }
 }
 
+struct RedirTask {
+    usbredir: UsbRedir<RdpUsb>,
+    rdp_handle: UsbDeviceHandle,
+    rx: UnboundedReceiver<RedirEvent>,
+}
+
+impl RedirTask {
+    fn new(
+        usbredir: UsbRedir<RdpUsb>,
+        rdp_handle: UsbDeviceHandle,
+        rx: UnboundedReceiver<RedirEvent>,
+    ) -> Self {
+        Self {
+            usbredir,
+            rdp_handle,
+            rx,
+        }
+    }
+
+    async fn start(self, announce: DeviceAnnounce) -> anyhow::Result<()> {
+        let key = announce.device_instance_id.clone();
+        let device = RdpUsbRedirDevice::new(announce, self.rdp_handle, self.rx);
+
+        tracing::debug!(%key, "connecting RDPEUSB device to QEMU usbredir chardev");
+        let connected = self.usbredir.connect_device(key.clone(), device).await?;
+        tracing::debug!(%key, connected, "QEMU usbredir device connection completed");
+        Ok(())
+    }
+}
+
 impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
     fn add_device(&mut self, device: DeviceAnnounce) -> ironrdp::pdu::PduResult<()> {
         if self.sender.is_some() {
@@ -78,7 +106,7 @@ impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
         }
         tracing::debug!(
             device_instance_id = %device.device_instance_id,
-            "starting RDPEUSB device bootstrap"
+            "starting usbredir device session"
         );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.sender = Some(tx);
@@ -156,19 +184,19 @@ impl qemu_display::UsbRedirBackend for RdpUsb {
 }
 
 struct RdpUsbRedirDevice {
-    data: redir_task::DeviceData,
+    announce: DeviceAnnounce,
     rdp_handle: UsbDeviceHandle,
     rx: UnboundedReceiver<RedirEvent>,
 }
 
 impl RdpUsbRedirDevice {
     fn new(
-        data: redir_task::DeviceData,
+        announce: DeviceAnnounce,
         rdp_handle: UsbDeviceHandle,
         rx: UnboundedReceiver<RedirEvent>,
     ) -> Self {
         Self {
-            data,
+            announce,
             rdp_handle,
             rx,
         }

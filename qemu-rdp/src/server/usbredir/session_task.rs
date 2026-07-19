@@ -2,18 +2,17 @@ use std::os::unix::net::UnixStream;
 
 use anyhow::Context as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use usbredir_proto::{Cap, Event, Host, Packet, Parser, ParserConfig};
+use usbredir_proto::{Cap, Event, Host, Parser, ParserConfig};
 
-use super::{proto, redir_task::DeviceAnnouncement, RdpUsbRedirDevice};
+use super::{proto, rdpeusb_io::RdpeusbDeviceIo, RdpUsbRedirDevice};
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 pub(super) struct SessionTask {
     stream: tokio::net::UnixStream,
     parser: Parser<Host>,
-    announcement: Option<DeviceAnnouncement>,
     bridge: proto::Bridge,
-    rx: tokio::sync::mpsc::UnboundedReceiver<super::RedirEvent>,
+    io: RdpeusbDeviceIo,
 }
 
 impl SessionTask {
@@ -22,7 +21,7 @@ impl SessionTask {
         let stream = tokio::net::UnixStream::from_std(stream)?;
 
         let RdpUsbRedirDevice {
-            data,
+            announce,
             rdp_handle,
             rx,
         } = device;
@@ -38,9 +37,8 @@ impl SessionTask {
         Ok(Self {
             stream,
             parser,
-            announcement: Some(data.device),
-            bridge: proto::Bridge::new(rdp_handle, data.configuration),
-            rx,
+            bridge: proto::Bridge::new(announce),
+            io: RdpeusbDeviceIo::new(rdp_handle, rx),
         })
     }
 
@@ -65,7 +63,7 @@ impl SessionTask {
                         .context("parse QEMU usbredir data")?;
                     self.handle_parser_events().await?;
                 }
-                event = self.rx.recv() => {
+                event = self.io.recv() => {
                     let Some(event) = event else {
                         tracing::debug!("RDPEUSB device event channel closed");
                         return Ok(());
@@ -77,7 +75,7 @@ impl SessionTask {
                             .context("encode usbredir response")?;
                     }
                 }
-            }
+            };
 
             let written = self.flush_output().await?;
             if written != 0 {
@@ -89,37 +87,25 @@ impl SessionTask {
     async fn handle_parser_events(&mut self) -> anyhow::Result<()> {
         while let Some(event) = self.parser.poll() {
             match event {
-                Event::Packet(packet) => match *packet {
-                    Packet::Hello { version, caps } => {
-                        tracing::debug!(%version, ?caps, "received QEMU usbredir Hello");
-                        self.announce_device()?;
+                Event::Packet(packet) => {
+                    let packets = self
+                        .bridge
+                        .handle_usbredir_packet(*packet, &mut self.io)
+                        .await?;
+                    for packet in packets {
+                        tracing::debug!(packet = ?packet, "send usbredir packet to QEMU");
+                        self.parser
+                            .send(&packet)
+                            .context("encode usbredir response")?;
                     }
-                    packet => self.bridge.handle_usbredir_packet(packet).await?,
-                },
+
+                    // Complete any response barrier before dispatching another
+                    // packet already queued by the sans-I/O parser.
+                    self.flush_output().await?;
+                }
                 Event::Error(error) => return Err(error).context("decode usbredir packet"),
             }
         }
-
-        Ok(())
-    }
-
-    fn announce_device(&mut self) -> anyhow::Result<()> {
-        let Some(announcement) = self.announcement.take() else {
-            anyhow::bail!("received a second usbredir Hello");
-        };
-
-        // usbredir requires endpoint and interface metadata before the device
-        // becomes visible to the guest.
-        self.parser
-            .send(&Packet::ep_info(announcement.ep_info))
-            .context("encode usbredir endpoint information")?;
-        self.parser
-            .send(&Packet::interface_info(announcement.interface_info))
-            .context("encode usbredir interface information")?;
-        self.parser
-            .send(&Packet::device_connect(announcement.device_connect))
-            .context("encode usbredir device connection")?;
-        tracing::debug!("queued usbredir EpInfo, InterfaceInfo, and DeviceConnect announcements");
 
         Ok(())
     }
