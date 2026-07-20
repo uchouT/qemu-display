@@ -69,7 +69,11 @@ impl SessionTask {
                         return Ok(());
                     };
 
-                    if let Some(packet) = self.bridge.handle_rdp_event(event)? {
+                    let packets = self
+                        .bridge
+                        .handle_rdp_event(event, &mut self.io)
+                        .await?;
+                    for packet in packets {
                         self.parser
                             .send(&packet)
                             .context("encode usbredir response")?;

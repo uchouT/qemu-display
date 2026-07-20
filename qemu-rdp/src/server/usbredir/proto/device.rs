@@ -2,7 +2,10 @@
 
 use anyhow::{bail, ensure, Context as _};
 use ironrdp_rdpeusb::{
-    io::{DeviceAnnounce, TransferInPacket, TsUrbInKind, TsUrbInPacket, UrbFunction},
+    io::{
+        DeviceAnnounce, TransferInCompletionResult, TransferInPacket, TsUrbInKind, TsUrbInPacket,
+        UrbFunction,
+    },
     pdu::{
         sink::DeviceSpeed,
         usb_dev::ts_urb::{
@@ -139,23 +142,25 @@ async fn get_descriptor(
 ) -> anyhow::Result<Vec<u8>> {
     let output_buffer_size =
         u32::try_from(length).context("USB descriptor request is too large")?;
-    io.transfer_in(TransferInPacket {
-        ts_urb: TsUrbInPacket {
-            kind: TsUrbInKind::CtlDescReq(TsUrbControlDescRequest {
-                index,
-                desc_type,
-                lang_id: 0,
-            }),
-            func: UrbFunction::URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE,
-        },
-        output_buffer_size,
-    })
-    .await
+    let completion = io
+        .wait_transfer_in(TransferInPacket {
+            ts_urb: TsUrbInPacket {
+                kind: TsUrbInKind::CtlDescReq(TsUrbControlDescRequest {
+                    index,
+                    desc_type,
+                    lang_id: 0,
+                }),
+                func: UrbFunction::URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE,
+            },
+            output_buffer_size,
+        })
+        .await?;
+    successful_transfer_in_output(completion)
 }
 
-async fn get_configuration(io: &mut RdpeusbDeviceIo) -> anyhow::Result<u8> {
-    let data = io
-        .transfer_in(TransferInPacket {
+pub(super) async fn get_configuration(io: &mut RdpeusbDeviceIo) -> anyhow::Result<u8> {
+    let completion = io
+        .wait_transfer_in(TransferInPacket {
             ts_urb: TsUrbInPacket {
                 kind: TsUrbInKind::CtlGetConfig(TsUrbControlGetConfigRequest),
                 func: UrbFunction::URB_FUNCTION_GET_CONFIGURATION,
@@ -164,6 +169,7 @@ async fn get_configuration(io: &mut RdpeusbDeviceIo) -> anyhow::Result<u8> {
         })
         .await
         .context("query active USB configuration")?;
+    let data = successful_transfer_in_output(completion)?;
 
     ensure!(
         data.len() == 1,
@@ -173,9 +179,9 @@ async fn get_configuration(io: &mut RdpeusbDeviceIo) -> anyhow::Result<u8> {
     Ok(data[0])
 }
 
-async fn get_interface(io: &mut RdpeusbDeviceIo, interface: u8) -> anyhow::Result<u8> {
-    let data = io
-        .transfer_in(TransferInPacket {
+pub(super) async fn get_interface(io: &mut RdpeusbDeviceIo, interface: u8) -> anyhow::Result<u8> {
+    let completion = io
+        .wait_transfer_in(TransferInPacket {
             ts_urb: TsUrbInPacket {
                 kind: TsUrbInKind::CtlGetIface(TsUrbControlGetInterfaceRequest {
                     interface: u16::from(interface),
@@ -186,6 +192,7 @@ async fn get_interface(io: &mut RdpeusbDeviceIo, interface: u8) -> anyhow::Resul
         })
         .await
         .with_context(|| format!("query alternate setting for USB interface {interface}"))?;
+    let data = successful_transfer_in_output(completion)?;
 
     ensure!(
         data.len() == 1,
@@ -193,4 +200,20 @@ async fn get_interface(io: &mut RdpeusbDeviceIo, interface: u8) -> anyhow::Resul
         data.len()
     );
     Ok(data[0])
+}
+
+fn successful_transfer_in_output(
+    completion: TransferInCompletionResult,
+) -> anyhow::Result<Vec<u8>> {
+    ensure!(
+        completion.hresult == 0,
+        "RDPEUSB transfer-in failed with HRESULT {:#010x}",
+        completion.hresult
+    );
+    ensure!(
+        completion.ts_urb_result.header.usbd_status == 0,
+        "USB transfer-in failed with USBD status {:#010x}",
+        completion.ts_urb_result.header.usbd_status
+    );
+    Ok(completion.output_buffer)
 }

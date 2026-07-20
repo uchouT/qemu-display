@@ -1,11 +1,14 @@
 use anyhow::{ensure, Context as _};
 use ironrdp_rdpeusb::io::DeviceAnnounce;
-use usbredir_proto::Packet;
+use usbredir_proto::{EpInfoData, InterfaceInfoData, Packet};
 
 use super::{rdpeusb_io::RdpeusbDeviceIo, RedirEvent};
 
+mod control_transfer;
 mod descriptor;
 mod device;
+mod request;
+mod transfer;
 
 /// Stateful boundary between usbredir packets and IronRDP device I/O.
 ///
@@ -14,8 +17,14 @@ mod device;
 pub(super) struct Bridge {
     pending_device: Option<DeviceAnnounce>,
     peer_hello_received: bool,
-    device: Option<DeviceAnnounce>,
-    configuration: Option<u8>,
+    device: Option<ActiveDevice>,
+}
+
+struct ActiveDevice {
+    source: DeviceAnnounce,
+    configuration: u8,
+    interface_info: InterfaceInfoData,
+    ep_info: EpInfoData,
 }
 
 impl Bridge {
@@ -24,7 +33,6 @@ impl Bridge {
             pending_device: Some(device),
             peer_hello_received: false,
             device: None,
-            configuration: None,
         }
     }
 
@@ -41,34 +49,51 @@ impl Bridge {
                 );
                 self.peer_hello_received = true;
                 tracing::debug!(%version, ?caps, "received QEMU usbredir Hello");
+                self.prepare_device_if_negotiated(io).await
             }
+            Packet::Request(request) => {
+                self.ensure_device_ready()?;
+                request::handle(self, request, io).await
+            }
+            Packet::Data(packet) => {
+                self.ensure_device_ready()?;
+                transfer::handle_data(packet, io).await
+            }
+            Packet::FilterFilter { rules } => todo!(),
+            Packet::FilterReject => todo!(),
             packet => {
                 ensure!(
                     self.peer_hello_received,
                     "received a usbredir packet before peer Hello"
                 );
-                ensure!(
-                    self.pending_device.is_none(),
-                    "received a usbredir device packet before device announcement"
-                );
-
-                // TODO: usbredir <-> rdpeusb translation
-                tracing::error!(
-                    ?packet,
-                    device_instance_id = ?self.device.as_ref().map(|device| device.device_instance_id.as_str()),
-                    configuration = ?self.configuration,
-                    "usbredir packet is awaiting RDPEUSB translation"
-                );
+                tracing::warn!(?packet, "Ignored unexpected usbredir packet from QEMU");
+                Ok(Vec::new())
             }
         }
-
-        self.prepare_device_if_negotiated(io).await
     }
 
-    pub(super) fn handle_rdp_event(&mut self, event: RedirEvent) -> anyhow::Result<Option<Packet>> {
-        // TODO: usbredir <-> rdpeusb translation
-        tracing::error!(?event, "RDPEUSB event is awaiting usbredir translation");
-        Ok(None)
+    pub(super) async fn handle_rdp_event(
+        &mut self,
+        event: RedirEvent,
+        io: &mut RdpeusbDeviceIo,
+    ) -> anyhow::Result<Vec<Packet>> {
+        transfer::handle_rdp_event(self, event, io).await
+    }
+
+    fn ensure_device_ready(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.peer_hello_received,
+            "received a usbredir packet before peer Hello"
+        );
+        ensure!(
+            self.pending_device.is_none(),
+            "received a usbredir device packet before device announcement"
+        );
+        ensure!(
+            self.device.is_some(),
+            "received a usbredir device packet before device preparation completed"
+        );
+        Ok(())
     }
 
     async fn prepare_device_if_negotiated(
@@ -90,16 +115,42 @@ impl Bridge {
         let device = device::prepare_device(announce, io)
             .await
             .context("prepare RDPEUSB device for usbredir")?;
-        self.device = Some(device.source);
-        self.configuration = Some(device.configuration);
+        let device::DeviceAnnouncement {
+            device_connect,
+            interface_info,
+            ep_info,
+        } = device.announcement;
+        self.device = Some(ActiveDevice {
+            source: device.source,
+            configuration: device.configuration,
+            interface_info,
+            ep_info,
+        });
 
         // usbredir requires endpoint and interface metadata before the device
         // becomes visible to the guest.
-        let announcement = device.announcement;
+        let mut packets = self.device_metadata_packets()?;
+        packets.push(Packet::device_connect(device_connect));
+        Ok(packets)
+    }
+
+    fn active_device(&self) -> anyhow::Result<&ActiveDevice> {
+        self.device
+            .as_ref()
+            .context("usbredir device is not prepared")
+    }
+
+    fn active_device_mut(&mut self) -> anyhow::Result<&mut ActiveDevice> {
+        self.device
+            .as_mut()
+            .context("usbredir device is not prepared")
+    }
+
+    fn device_metadata_packets(&self) -> anyhow::Result<Vec<Packet>> {
+        let device = self.active_device()?;
         Ok(vec![
-            Packet::ep_info(announcement.ep_info),
-            Packet::interface_info(announcement.interface_info),
-            Packet::device_connect(announcement.device_connect),
+            Packet::ep_info(device.ep_info.clone()),
+            Packet::interface_info(device.interface_info.clone()),
         ])
     }
 }

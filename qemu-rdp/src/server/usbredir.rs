@@ -52,10 +52,50 @@ struct RdpUsbRedirDeviceBackend {
 
 #[derive(Debug)]
 enum RedirEvent {
-    TransferInCompleted {
-        request_id: RequestId,
-        completion: TransferInCompletionResult,
-    },
+    DeviceText(DeviceText),
+    Completion(RdpeusbCompletion),
+}
+
+#[derive(Debug)]
+struct RdpeusbCompletion {
+    channel_id: u32,
+    request_id: RequestId,
+    kind: RdpeusbCompletionKind,
+}
+
+#[derive(Debug)]
+enum RdpeusbCompletionKind {
+    IoControl(IoControlCompletionResult),
+    InternalIoControl(IoControlCompletionResult),
+    TransferIn(TransferInCompletionResult),
+    TransferOut(TransferOutCompletionResult),
+}
+
+impl RedirEvent {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::DeviceText(_) => "device-text",
+            Self::Completion(completion) => completion.kind.name(),
+        }
+    }
+
+    fn request_id(&self) -> Option<RequestId> {
+        match self {
+            Self::DeviceText(_) => None,
+            Self::Completion(completion) => Some(completion.request_id),
+        }
+    }
+}
+
+impl RdpeusbCompletionKind {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::IoControl(_) => "io-control",
+            Self::InternalIoControl(_) => "internal-io-control",
+            Self::TransferIn(_) => "transfer-in",
+            Self::TransferOut(_) => "transfer-out",
+        }
+    }
 }
 
 impl RdpUsbRedirDeviceBackend {
@@ -64,6 +104,27 @@ impl RdpUsbRedirDeviceBackend {
             usbredir,
             rdp_handle,
             sender: None,
+        }
+    }
+
+    fn send_event(&self, event: RedirEvent) {
+        let event_kind = event.kind_name();
+        let request_id = event.request_id();
+        let Some(sender) = &self.sender else {
+            tracing::warn!(
+                event_kind,
+                ?request_id,
+                "received an RDPEUSB event before the usbredir device session started"
+            );
+            return;
+        };
+
+        if sender.send(event).is_err() {
+            tracing::trace!(
+                event_kind,
+                ?request_id,
+                "discarded an RDPEUSB event after the usbredir device session stopped"
+            );
         }
     }
 }
@@ -120,7 +181,7 @@ impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
     }
 
     fn device_text(&mut self, device_text: DeviceText) {
-        todo!("check the data, send to qemu unix stream")
+        self.send_event(RedirEvent::DeviceText(device_text));
     }
 
     fn io_control_completed(
@@ -129,7 +190,12 @@ impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
         request_id: RequestId,
         completion: IoControlCompletionResult,
     ) -> ironrdp::pdu::PduResult<()> {
-        todo!("check the data, send to qemu unix stream")
+        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
+            channel_id,
+            request_id,
+            kind: RdpeusbCompletionKind::IoControl(completion),
+        }));
+        Ok(())
     }
 
     fn internal_io_control_completed(
@@ -138,21 +204,25 @@ impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
         request_id: RequestId,
         completion: IoControlCompletionResult,
     ) -> ironrdp::pdu::PduResult<()> {
-        todo!("check the data, send to qemu unix stream")
+        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
+            channel_id,
+            request_id,
+            kind: RdpeusbCompletionKind::InternalIoControl(completion),
+        }));
+        Ok(())
     }
 
     fn transfer_in_completed(
         &mut self,
-        _channel_id: u32,
+        channel_id: u32,
         request_id: RequestId,
         completion: TransferInCompletionResult,
     ) -> ironrdp::pdu::PduResult<()> {
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(RedirEvent::TransferInCompleted {
-                request_id,
-                completion,
-            });
-        }
+        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
+            channel_id,
+            request_id,
+            kind: RdpeusbCompletionKind::TransferIn(completion),
+        }));
         Ok(())
     }
 
@@ -162,7 +232,12 @@ impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
         request_id: RequestId,
         completion: TransferOutCompletionResult,
     ) -> ironrdp::pdu::PduResult<()> {
-        todo!("check the data, send to qemu unix stream")
+        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
+            channel_id,
+            request_id,
+            kind: RdpeusbCompletionKind::TransferOut(completion),
+        }));
+        Ok(())
     }
 }
 

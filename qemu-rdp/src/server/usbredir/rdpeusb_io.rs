@@ -1,17 +1,20 @@
 use std::collections::VecDeque;
 
-use anyhow::ensure;
-use ironrdp_rdpeusb::io::TransferInPacket;
+use anyhow::{bail, ensure};
+use ironrdp_rdpeusb::io::{
+    InternalIoControlPacket, IoControlCompletionResult, IoControlPacket, RequestId,
+    TransferInCompletionResult, TransferInPacket, TransferOutCompletionResult, TransferOutPacket,
+};
 use ironrdp_server::UsbDeviceHandle;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::RedirEvent;
+use super::{RdpeusbCompletion, RdpeusbCompletionKind, RedirEvent};
 
 /// Per-device RDPEUSB I/O endpoint.
 ///
-/// This is the only owner of the device event receiver. The session loop uses
-/// [`Self::recv`] while idle, and synchronous protocol operations temporarily
-/// take over the same receiver through methods such as [`Self::transfer_in`].
+/// This is the only owner of the device event receiver. The session loop calls
+/// [`Self::recv`] normally, while synchronous operations temporarily consume
+/// the same receiver through methods such as [`Self::wait_transfer_in`].
 pub(super) struct RdpeusbDeviceIo {
     handle: UsbDeviceHandle,
     rx: UnboundedReceiver<RedirEvent>,
@@ -27,7 +30,7 @@ impl RdpeusbDeviceIo {
         }
     }
 
-    /// Receives the next event not consumed by a synchronous operation.
+    /// Receives the next event available to the outer session loop.
     pub(super) async fn recv(&mut self) -> Option<RedirEvent> {
         if let Some(event) = self.deferred.pop_front() {
             return Some(event);
@@ -36,53 +39,167 @@ impl RdpeusbDeviceIo {
         self.rx.recv().await
     }
 
-    /// Performs an RDPEUSB `TRANSFER_IN_REQUEST` and waits for its completion.
+    /// Waits for one request's completion while preserving unrelated events.
     ///
-    /// Completions for other outstanding requests are preserved for the outer
-    /// session event loop instead of being dropped.
-    pub(super) async fn transfer_in(
+    /// The deferred queue is searched first because another synchronous wait
+    /// may already have received and parked this completion.
+    pub(super) async fn wait_completion(
         &mut self,
-        packet: TransferInPacket,
-    ) -> anyhow::Result<Vec<u8>> {
-        let sent = self.handle.transfer_in_request(packet).await?;
-        ensure!(
-            sent.expects_completion,
-            "RDPEUSB transfer-in unexpectedly has no completion"
-        );
+        request_id: RequestId,
+    ) -> anyhow::Result<RdpeusbCompletion> {
+        if let Some(completion) = take_deferred_completion(&mut self.deferred, request_id) {
+            return Ok(completion);
+        }
 
         loop {
             let event = self.rx.recv().await.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "USB device session dropped while waiting for transfer-in completion"
+                    "USB device session dropped while waiting for RDPEUSB request {request_id}"
                 )
             })?;
 
             match event {
-                RedirEvent::TransferInCompleted {
-                    request_id,
-                    completion,
-                } if request_id == sent.request_id => {
-                    ensure!(
-                        completion.hresult == 0,
-                        "RDPEUSB transfer-in failed with HRESULT {:#010x}",
-                        completion.hresult
-                    );
-                    ensure!(
-                        completion.ts_urb_result.header.usbd_status == 0,
-                        "USB transfer-in failed with USBD status {:#010x}",
-                        completion.ts_urb_result.header.usbd_status
-                    );
-                    return Ok(completion.output_buffer);
+                RedirEvent::Completion(completion) if completion.request_id == request_id => {
+                    return Ok(completion);
                 }
                 event => {
                     tracing::trace!(
-                        request_id = sent.request_id,
-                        ?event,
-                        "deferred unrelated RDPEUSB event while waiting for transfer-in completion"
+                        waiting_request_id = request_id,
+                        deferred_request_id = ?event.request_id(),
+                        event_kind = event.kind_name(),
+                        "deferred an unrelated RDPEUSB event"
                     );
                     self.deferred.push_back(event);
                 }
             }
         }
     }
+
+    /// Sends a transfer-in request and waits for its complete RDPEUSB result.
+    pub(super) async fn wait_transfer_in(
+        &mut self,
+        packet: TransferInPacket,
+    ) -> anyhow::Result<TransferInCompletionResult> {
+        let sent = self.handle.transfer_in_request(packet).await?;
+        ensure!(
+            sent.expects_completion,
+            "RDPEUSB transfer-in unexpectedly has no completion"
+        );
+
+        let completion = self.wait_completion(sent.request_id).await?;
+        match completion.kind {
+            RdpeusbCompletionKind::TransferIn(completion) => Ok(completion),
+            kind => bail!(
+                "RDPEUSB request {} expected transfer-in completion, received {}",
+                sent.request_id,
+                kind.name()
+            ),
+        }
+    }
+
+    /// Sends a transfer-out request and waits for its complete RDPEUSB result.
+    ///
+    /// `None` is returned for a valid no-ack isochronous transfer, for which
+    /// RDPEUSB deliberately sends no completion.
+    pub(super) async fn wait_transfer_out(
+        &mut self,
+        packet: TransferOutPacket,
+    ) -> anyhow::Result<Option<TransferOutCompletionResult>> {
+        let sent = self.handle.transfer_out_request(packet).await?;
+        if !sent.expects_completion {
+            return Ok(None);
+        }
+
+        let completion = self.wait_completion(sent.request_id).await?;
+        match completion.kind {
+            RdpeusbCompletionKind::TransferOut(completion) => Ok(Some(completion)),
+            kind => bail!(
+                "RDPEUSB request {} expected transfer-out completion, received {}",
+                sent.request_id,
+                kind.name()
+            ),
+        }
+    }
+
+    /// Sends an I/O-control request and waits for its complete result.
+    pub(super) async fn wait_io_control(
+        &mut self,
+        packet: IoControlPacket,
+    ) -> anyhow::Result<IoControlCompletionResult> {
+        let sent = self.handle.ioctl_request(packet).await?;
+        ensure!(
+            sent.expects_completion,
+            "RDPEUSB I/O control unexpectedly has no completion"
+        );
+
+        let completion = self.wait_completion(sent.request_id).await?;
+        match completion.kind {
+            RdpeusbCompletionKind::IoControl(completion) => Ok(completion),
+            kind => bail!(
+                "RDPEUSB request {} expected I/O-control completion, received {}",
+                sent.request_id,
+                kind.name()
+            ),
+        }
+    }
+
+    /// Sends an internal-I/O-control request and waits for its complete result.
+    pub(super) async fn wait_internal_io_control(
+        &mut self,
+        packet: InternalIoControlPacket,
+    ) -> anyhow::Result<IoControlCompletionResult> {
+        let sent = self.handle.internal_ioctl_request(packet).await?;
+        ensure!(
+            sent.expects_completion,
+            "RDPEUSB internal I/O control unexpectedly has no completion"
+        );
+
+        let completion = self.wait_completion(sent.request_id).await?;
+        match completion.kind {
+            RdpeusbCompletionKind::InternalIoControl(completion) => Ok(completion),
+            kind => bail!(
+                "RDPEUSB request {} expected internal-I/O-control completion, received {}",
+                sent.request_id,
+                kind.name()
+            ),
+        }
+    }
+
+    /// Queues an RDPEUSB cancel request.
+    ///
+    /// This is fire-and-forget: success only means the server event was
+    /// accepted locally, not that the cancel PDU was written or acknowledged.
+    /// A canceled request does not produce a completion, so the bridge must
+    /// finish its corresponding usbredir request locally.
+    ///
+    /// IronRDP also needs to retire the server-side pending entry when it
+    /// sends the cancel; the qemu-rdp layer cannot repair that bookkeeping.
+    pub(super) fn cancel(&self, request_id: RequestId) -> anyhow::Result<()> {
+        self.handle.cancel_request(request_id)
+    }
+
+    /// Queues a device-text query.
+    ///
+    /// RDPEUSB does not attach a request ID to its response, so the resulting
+    /// [`RedirEvent::DeviceText`] is handled only by the outer event loop.
+    /// Callers must serialize queries if response association matters.
+    pub(super) fn query_device_text(&self, text_type: u32, locale_id: u32) -> anyhow::Result<()> {
+        self.handle.query_device_text_request(text_type, locale_id)
+    }
+}
+
+fn take_deferred_completion(
+    deferred: &mut VecDeque<RedirEvent>,
+    request_id: RequestId,
+) -> Option<RdpeusbCompletion> {
+    let index = deferred
+        .iter()
+        .position(|event| event.request_id() == Some(request_id))?;
+    let event = deferred
+        .remove(index)
+        .expect("deferred completion index came from the same queue");
+    let RedirEvent::Completion(completion) = event else {
+        unreachable!("only completion events carry request IDs");
+    };
+    Some(completion)
 }
