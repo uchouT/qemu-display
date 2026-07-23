@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Duration};
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context as _};
 use ironrdp_rdpeusb::io::{
     InternalIoControlPacket, IoControlCompletionResult, IoControlPacket, RequestId,
     TransferInCompletionResult, TransferInPacket, TransferOutCompletionResult, TransferOutPacket,
@@ -9,6 +9,8 @@ use ironrdp_server::UsbDeviceHandle;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::{RdpeusbCompletion, RdpeusbCompletionKind, RedirEvent};
+
+const RDPEUSB_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-device RDPEUSB I/O endpoint.
 ///
@@ -39,11 +41,15 @@ impl RdpeusbDeviceIo {
         self.rx.recv().await
     }
 
+    /// Per USB redirection protocol v0.7: Control packets are handled synchroneously inside the
+    /// usb-host, it will hand the request over to the host os and then *wait* for a response. The
+    /// usb-host will thus stop processing further packets.
+    ///
     /// Waits for one request's completion while preserving unrelated events.
     ///
-    /// The deferred queue is searched first because another synchronous wait
-    /// may already have received and parked this completion.
-    pub(super) async fn wait_completion(
+    /// The deferred queue is searched first because another synchronous wait may already have
+    /// received and parked this completion.
+    async fn wait_completion(
         &mut self,
         request_id: RequestId,
     ) -> anyhow::Result<RdpeusbCompletion> {
@@ -51,28 +57,37 @@ impl RdpeusbDeviceIo {
             return Ok(completion);
         }
 
-        loop {
-            let event = self.rx.recv().await.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "USB device session dropped while waiting for RDPEUSB request {request_id}"
-                )
-            })?;
+        tokio::time::timeout(RDPEUSB_COMPLETION_TIMEOUT, async {
+            loop {
+                let event = self.rx.recv().await.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "USB device session dropped while waiting for RDPEUSB request {request_id}"
+                    )
+                })?;
 
-            match event {
-                RedirEvent::Completion(completion) if completion.request_id == request_id => {
-                    return Ok(completion);
-                }
-                event => {
-                    tracing::trace!(
-                        waiting_request_id = request_id,
-                        deferred_request_id = ?event.request_id(),
-                        event_kind = event.kind_name(),
-                        "deferred an unrelated RDPEUSB event"
-                    );
-                    self.deferred.push_back(event);
+                match event {
+                    RedirEvent::Completion(completion) if completion.request_id == request_id => {
+                        return Ok(completion);
+                    }
+                    event => {
+                        tracing::trace!(
+                            waiting_request_id = request_id,
+                            deferred_request_id = ?event.request_id(),
+                            event_kind = event.kind_name(),
+                            "deferred an unrelated RDPEUSB event"
+                        );
+                        self.deferred.push_back(event);
+                    }
                 }
             }
-        }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "timed out after {:?} waiting for RDPEUSB request {request_id} completion",
+                RDPEUSB_COMPLETION_TIMEOUT
+            )
+        })?
     }
 
     /// Sends a transfer-in request and waits for its complete RDPEUSB result.
@@ -185,6 +200,11 @@ impl RdpeusbDeviceIo {
     /// Callers must serialize queries if response association matters.
     pub(super) fn query_device_text(&self, text_type: u32, locale_id: u32) -> anyhow::Result<()> {
         self.handle.query_device_text_request(text_type, locale_id)
+    }
+
+    /// Isochronous RDPEUSB device handle.
+    pub(super) fn handle(&self) -> &UsbDeviceHandle {
+        &self.handle
     }
 }
 
