@@ -13,6 +13,10 @@ use ironrdp_rdpeusb::{
 use usbredir_proto::{DataKind, DataPacket, Endpoint, Packet, Status};
 
 use super::super::rdpeusb_io::RdpeusbDeviceIo;
+use super::{
+    descriptor::{self, ConfigurationDescriptor},
+    state::ActiveDevice,
+};
 
 const USB_DIRECTION_IN: u8 = 0x80;
 const USB_REQUEST_TYPE_MASK: u8 = 0x60;
@@ -24,6 +28,8 @@ const USB_RECIPIENT_DEVICE: u8 = 0;
 const USB_RECIPIENT_INTERFACE: u8 = 1;
 const USB_RECIPIENT_ENDPOINT: u8 = 2;
 const USB_RECIPIENT_OTHER: u8 = 3;
+const USB_STANDARD_DEVICE_IN: u8 =
+    USB_DIRECTION_IN | USB_REQUEST_TYPE_STANDARD | USB_RECIPIENT_DEVICE;
 
 const USB_REQUEST_GET_STATUS: u8 = 0x00;
 const USB_REQUEST_CLEAR_FEATURE: u8 = 0x01;
@@ -46,7 +52,13 @@ struct ControlRequest {
     data: Bytes,
 }
 
+enum CacheableDescriptor {
+    Device,
+    Configuration(u8),
+}
+
 pub(super) async fn handle(
+    active_device: &mut ActiveDevice,
     packet: DataPacket,
     io: &mut RdpeusbDeviceIo,
 ) -> anyhow::Result<Vec<Packet>> {
@@ -104,6 +116,15 @@ pub(super) async fn handle(
         }
     };
 
+    if let Some(data) = request.cached_descriptor_response(active_device) {
+        tracing::trace!(
+            id,
+            actual_length = data.len(),
+            "Completed usbredir control request from the descriptor cache"
+        );
+        return Ok(vec![request.response(Status::Success, data)]);
+    }
+
     let packet = match io
         .wait_transfer_in(transfer)
         .await
@@ -111,6 +132,18 @@ pub(super) async fn handle(
     {
         Ok(mut data) => {
             data.truncate(usize::from(request.length));
+            if let Err(error) = request.cache_configuration_response(active_device, &data) {
+                // The transfer itself succeeded. A malformed descriptor must
+                // not rewrite that guest-visible result.
+                tracing::warn!(
+                    id,
+                    request = request.request,
+                    value = request.value,
+                    index = request.index,
+                    %error,
+                    "Did not cache a successful USB descriptor response"
+                );
+            }
             tracing::trace!(
                 id,
                 actual_length = data.len(),
@@ -148,13 +181,55 @@ impl ControlRequest {
             data,
         )
     }
+
+    fn cacheable_descriptor(&self) -> Option<CacheableDescriptor> {
+        if self.request_type != USB_STANDARD_DEVICE_IN
+            || self.request != USB_REQUEST_GET_DESCRIPTOR
+            || self.index != 0
+        {
+            return None;
+        }
+
+        let [index, descriptor_type] = self.value.to_le_bytes();
+        match (descriptor_type, index) {
+            (descriptor::DEVICE_DESCRIPTOR_TYPE, 0) => Some(CacheableDescriptor::Device),
+            (descriptor::CONFIG_DESCRIPTOR_TYPE, index) => {
+                Some(CacheableDescriptor::Configuration(index))
+            }
+            _ => None,
+        }
+    }
+
+    fn cached_descriptor_response(&self, active_device: &ActiveDevice) -> Option<Vec<u8>> {
+        let bytes = match self.cacheable_descriptor()? {
+            CacheableDescriptor::Device => active_device.device_descriptor_bytes(),
+            CacheableDescriptor::Configuration(index) => active_device
+                .configuration_descriptor_by_index(index)?
+                .bytes(),
+        };
+        let response_length = bytes.len().min(usize::from(self.length));
+        Some(bytes[..response_length].to_vec())
+    }
+
+    fn cache_configuration_response(
+        &self,
+        active_device: &mut ActiveDevice,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let Some(CacheableDescriptor::Configuration(index)) = self.cacheable_descriptor() else {
+            return Ok(());
+        };
+        let Some(descriptor) = ConfigurationDescriptor::parse_if_complete(bytes)? else {
+            return Ok(());
+        };
+        active_device.insert_configuration_descriptor(index, descriptor)
+    }
 }
 
 fn rdpeusb_request(request: &ControlRequest) -> Result<TransferInPacket, Status> {
     // Prefer the handle-free, operation-specific URBs used by MS-RDPEUSB
-    // 2.2.9.9 through 2.2.9.14. A generic TS_URB_CONTROL_TRANSFER requires a
-    // pipe handle obtained by SELECT_CONFIGURATION/SELECT_INTERFACE, which is
-    // deliberately outside this read-only enumeration stage.
+    // 2.2.9.9 through 2.2.9.14. Unsupported requests will later fall back to
+    // a generic TS_URB_CONTROL_TRANSFER using the active device's current binding.
     let direction_in = request.request_type & USB_DIRECTION_IN != 0;
     if request.endpoint.number() != 0 || request.endpoint.is_input() != direction_in {
         return Err(Status::Inval);

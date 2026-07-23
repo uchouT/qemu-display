@@ -5,35 +5,36 @@ use usbredir_proto::{DataKind, DataPacket, Packet};
 use super::super::{
     rdpeusb_io::RdpeusbDeviceIo, RdpeusbCompletion, RdpeusbCompletionKind, RedirEvent,
 };
-use super::{control_transfer, Bridge};
+use super::{control_transfer, state::ActiveDevice};
 
 pub(super) async fn handle_data(
+    active_device: &mut ActiveDevice,
     packet: DataPacket,
     io: &mut RdpeusbDeviceIo,
 ) -> anyhow::Result<Vec<Packet>> {
+    // Every endpoint-based implementation added here must resolve its pipe
+    // from the handles installed by a successful SetConfiguration or
+    // SetAltSetting transaction.
     if !matches!(&packet.kind, DataKind::Control { .. }) {
         tracing::warn!(
             id = packet.id,
             endpoint = ?packet.endpoint,
             kind = ?packet.kind,
-            "Ignored usbredir data transfer outside the enumeration path"
+            "Ignored usbredir data transfer whose RDPEUSB translation is not implemented"
         );
         return Ok(Vec::new());
     }
 
-    control_transfer::handle(packet, io).await
+    control_transfer::handle(active_device, packet, io).await
 }
 
 pub(super) async fn handle_rdp_event(
-    bridge: &mut Bridge,
+    active_device: &mut ActiveDevice,
     event: RedirEvent,
     _io: &mut RdpeusbDeviceIo,
 ) -> anyhow::Result<Vec<Packet>> {
     // TODO: usbredir <-> rdpeusb translation
-    let device_instance_id = bridge
-        .device
-        .as_ref()
-        .map(|device| device.source.device_instance_id.as_str());
+    let device_instance_id = active_device.source.device_instance_id.as_str();
     match event {
         RedirEvent::DeviceText(device_text) => {
             tracing::error!(

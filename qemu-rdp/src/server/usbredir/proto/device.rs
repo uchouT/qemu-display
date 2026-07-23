@@ -1,4 +1,4 @@
-//! RDPEUSB device discovery and usbredir announcement construction.
+//! RDPEUSB device discovery and selection operations.
 
 use anyhow::{bail, ensure, Context as _};
 use ironrdp_rdpeusb::{
@@ -7,39 +7,30 @@ use ironrdp_rdpeusb::{
         UrbFunction,
     },
     pdu::{
-        sink::DeviceSpeed,
-        usb_dev::ts_urb::{
-            TsUrbControlDescRequest, TsUrbControlGetConfigRequest, TsUrbControlGetInterfaceRequest,
+        completion::ts_urb_result::{
+            TsUrbResultPayload, TsUrbSelectConfigResult, TsUrbSelectInterfaceResult,
         },
+        sink::DeviceSpeed,
+        usb_dev::ts_urb::{TsUrbControlDescRequest, TsUrbSelectConfig, TsUrbSelectInterface},
     },
 };
-use usbredir_proto::{DeviceConnectInfo, EpInfoData, InterfaceInfoData, Speed};
+use usbredir_proto::Speed;
 
 use super::super::rdpeusb_io::RdpeusbDeviceIo;
-use super::descriptor::{self, ConfigurationDescriptor, DeviceDescriptor};
+use super::descriptor::{self, ConfigurationDescriptor};
 
-/// Initial device state needed by the usbredir bridge.
+/// Minimum physical-device identity needed to create the guest-visible model.
 pub(super) struct PreparedDevice {
     pub(super) source: DeviceAnnounce,
-    pub(super) announcement: DeviceAnnouncement,
-    pub(super) configuration: u8,
-}
-
-/// Metadata sent before usbredir makes the device visible to the guest.
-///
-/// Ref: usbredir protocol v0.7, `usb_redir_device_connect`: send `ep_info`,
-/// then `interface_info`, and only then `device_connect`.
-pub(super) struct DeviceAnnouncement {
-    pub(super) device_connect: DeviceConnectInfo,
-    pub(super) interface_info: InterfaceInfoData,
-    pub(super) ep_info: EpInfoData,
+    pub(super) device_descriptor_bytes: Vec<u8>,
+    pub(super) speed: Speed,
 }
 
 pub(super) async fn prepare_device(
     announce: DeviceAnnounce,
     io: &mut RdpeusbDeviceIo,
 ) -> anyhow::Result<PreparedDevice> {
-    let device_descriptor = get_descriptor(
+    let device_descriptor_bytes = get_descriptor(
         io,
         descriptor::DEVICE_DESCRIPTOR_TYPE,
         0,
@@ -47,28 +38,6 @@ pub(super) async fn prepare_device(
     )
     .await
     .context("query USB device descriptor")?;
-    let device_descriptor = DeviceDescriptor::parse(&device_descriptor)?;
-
-    let configuration = get_configuration(io).await?;
-    let config_descriptor = if configuration == 0 {
-        None
-    } else {
-        Some(
-            get_active_config_descriptor(io, device_descriptor.num_configurations, configuration)
-                .await?,
-        )
-    };
-
-    let active_interfaces = if let Some(config_descriptor) = &config_descriptor {
-        let mut active = Vec::with_capacity(config_descriptor.interfaces.len());
-        for interface in config_descriptor.interfaces.keys().copied() {
-            let alt_setting = get_interface(io, interface).await?;
-            active.push((interface, alt_setting));
-        }
-        active
-    } else {
-        Vec::new()
-    };
 
     // Ref: MS-RDPEUSB `ADD_DEVICE` / `UsbDeviceCaps.DeviceSpeed` and
     // usbredir v0.7 `usb_redir_device_connect`.
@@ -80,39 +49,19 @@ pub(super) async fn prepare_device(
         DeviceSpeed::FULL_SPEED => Speed::Full,
         _ => Speed::Unknown,
     };
-    let (interface_info, ep_info) = descriptor::usbredir_config_info(
-        &device_descriptor,
-        config_descriptor.as_ref(),
-        &active_interfaces,
-        speed,
-    )?;
-
     Ok(PreparedDevice {
         source: announce,
-        // Ref: usbredir protocol v0.7, `usb_redir_device_connect`.
-        announcement: DeviceAnnouncement {
-            device_connect: DeviceConnectInfo {
-                speed,
-                device_class: device_descriptor.device_class,
-                device_subclass: device_descriptor.device_subclass,
-                device_protocol: device_descriptor.device_protocol,
-                vendor_id: device_descriptor.vendor_id,
-                product_id: device_descriptor.product_id,
-                device_version_bcd: device_descriptor.device_version,
-            },
-            interface_info,
-            ep_info,
-        },
-        configuration,
+        device_descriptor_bytes,
+        speed,
     })
 }
 
-async fn get_active_config_descriptor(
+pub(super) async fn get_config_descriptor(
     io: &mut RdpeusbDeviceIo,
-    num_configurations: u8,
-    active_configuration: u8,
-) -> anyhow::Result<ConfigurationDescriptor> {
-    for index in 0..num_configurations {
+    indices: &[u8],
+    configuration: u8,
+) -> anyhow::Result<Option<(u8, ConfigurationDescriptor)>> {
+    for &index in indices {
         let header = get_descriptor(
             io,
             descriptor::CONFIG_DESCRIPTOR_TYPE,
@@ -123,15 +72,70 @@ async fn get_active_config_descriptor(
         .with_context(|| format!("query USB configuration descriptor {index} header"))?;
         let (total_length, configuration_value) = ConfigurationDescriptor::parse_header(&header)?;
 
-        if configuration_value == active_configuration {
+        if configuration_value == configuration {
             let bytes = get_descriptor(io, descriptor::CONFIG_DESCRIPTOR_TYPE, index, total_length)
                 .await
                 .with_context(|| format!("query USB configuration descriptor {index}"))?;
-            return ConfigurationDescriptor::parse(&bytes);
+            let descriptor = ConfigurationDescriptor::parse(&bytes)?;
+            ensure!(
+                descriptor.configuration_value() == configuration,
+                "USB configuration descriptor {index} changed between header and full reads"
+            );
+            return Ok(Some((index, descriptor)));
         }
     }
 
-    bail!("active USB configuration {active_configuration} has no descriptor")
+    Ok(None)
+}
+
+pub(super) async fn select_configuration(
+    io: &mut RdpeusbDeviceIo,
+    request: TsUrbSelectConfig,
+) -> anyhow::Result<TsUrbSelectConfigResult> {
+    let completion = io
+        .wait_transfer_in(TransferInPacket {
+            ts_urb: TsUrbInPacket {
+                kind: TsUrbInKind::SelectConfig(request),
+                func: UrbFunction::URB_FUNCTION_SELECT_CONFIGURATION,
+            },
+            output_buffer_size: 0,
+        })
+        .await
+        .context("select USB configuration")?;
+    ensure_successful_transfer_in(&completion)?;
+    ensure!(
+        completion.output_buffer.is_empty(),
+        "SELECT_CONFIGURATION unexpectedly returned output data"
+    );
+    let Some(TsUrbResultPayload::SelectConfig(result)) = completion.ts_urb_result.payload else {
+        bail!("SELECT_CONFIGURATION completion has no select-configuration result")
+    };
+    Ok(result)
+}
+
+pub(super) async fn select_interface(
+    io: &mut RdpeusbDeviceIo,
+    request: TsUrbSelectInterface,
+) -> anyhow::Result<TsUrbSelectInterfaceResult> {
+    let completion = io
+        .wait_transfer_in(TransferInPacket {
+            ts_urb: TsUrbInPacket {
+                kind: TsUrbInKind::SelectIface(request),
+                func: UrbFunction::URB_FUNCTION_SELECT_INTERFACE,
+            },
+            output_buffer_size: 0,
+        })
+        .await
+        .context("select USB interface")?;
+    ensure_successful_transfer_in(&completion)?;
+    ensure!(
+        completion.output_buffer.is_empty(),
+        "SELECT_INTERFACE unexpectedly returned output data"
+    );
+    let Some(TsUrbResultPayload::SelectIface(result)) = completion.ts_urb_result.payload else {
+        bail!("SELECT_INTERFACE completion has no select-interface result")
+    };
+    Ok(result)
 }
 
 async fn get_descriptor(
@@ -158,53 +162,14 @@ async fn get_descriptor(
     successful_transfer_in_output(completion)
 }
 
-pub(super) async fn get_configuration(io: &mut RdpeusbDeviceIo) -> anyhow::Result<u8> {
-    let completion = io
-        .wait_transfer_in(TransferInPacket {
-            ts_urb: TsUrbInPacket {
-                kind: TsUrbInKind::CtlGetConfig(TsUrbControlGetConfigRequest),
-                func: UrbFunction::URB_FUNCTION_GET_CONFIGURATION,
-            },
-            output_buffer_size: 1,
-        })
-        .await
-        .context("query active USB configuration")?;
-    let data = successful_transfer_in_output(completion)?;
-
-    ensure!(
-        data.len() == 1,
-        "GET_CONFIGURATION returned {} bytes",
-        data.len()
-    );
-    Ok(data[0])
-}
-
-pub(super) async fn get_interface(io: &mut RdpeusbDeviceIo, interface: u8) -> anyhow::Result<u8> {
-    let completion = io
-        .wait_transfer_in(TransferInPacket {
-            ts_urb: TsUrbInPacket {
-                kind: TsUrbInKind::CtlGetIface(TsUrbControlGetInterfaceRequest {
-                    interface: u16::from(interface),
-                }),
-                func: UrbFunction::URB_FUNCTION_GET_INTERFACE,
-            },
-            output_buffer_size: 1,
-        })
-        .await
-        .with_context(|| format!("query alternate setting for USB interface {interface}"))?;
-    let data = successful_transfer_in_output(completion)?;
-
-    ensure!(
-        data.len() == 1,
-        "GET_INTERFACE returned {} bytes",
-        data.len()
-    );
-    Ok(data[0])
-}
-
 fn successful_transfer_in_output(
     completion: TransferInCompletionResult,
 ) -> anyhow::Result<Vec<u8>> {
+    ensure_successful_transfer_in(&completion)?;
+    Ok(completion.output_buffer)
+}
+
+fn ensure_successful_transfer_in(completion: &TransferInCompletionResult) -> anyhow::Result<()> {
     ensure!(
         completion.hresult == 0,
         "RDPEUSB transfer-in failed with HRESULT {:#010x}",
@@ -215,5 +180,5 @@ fn successful_transfer_in_output(
         "USB transfer-in failed with USBD status {:#010x}",
         completion.ts_urb_result.header.usbd_status
     );
-    Ok(completion.output_buffer)
+    Ok(())
 }
