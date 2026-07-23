@@ -289,7 +289,7 @@ impl RdpUsbSession {
         let task = session_task::SessionTask::new(device, stream)?;
         let task = tokio::spawn(async move {
             if let Err(error) = task.run().await {
-                tracing::error!(%error, "USB redirection session failed");
+                tracing::error!(?error, "USB redirection session failed");
             }
         });
 
