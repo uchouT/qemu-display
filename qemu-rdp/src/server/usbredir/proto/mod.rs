@@ -17,6 +17,7 @@ mod transfer;
 /// device discovery, packet translation, and request correlation belong here.
 pub(super) struct Bridge {
     state: BridgeState,
+    pending: transfer::PendingTransfers,
 }
 
 /// Mutually exclusive phases of one usbredir bridge session.
@@ -31,6 +32,7 @@ impl Bridge {
     pub(super) fn new(device: DeviceAnnounce) -> Self {
         Self {
             state: BridgeState::AwaitingPeerHello(device),
+            pending: transfer::PendingTransfers::default(),
         }
     }
 
@@ -42,7 +44,8 @@ impl Bridge {
         match packet {
             Packet::Hello { version, caps } => self.handle_peer_hello(version, caps, io).await,
             packet => {
-                let device = match &mut self.state {
+                let Self { state, pending } = self;
+                let device = match state {
                     BridgeState::Active(device) => device,
                     BridgeState::AwaitingPeerHello(_) => {
                         bail!("received a usbredir packet before peer Hello")
@@ -53,8 +56,12 @@ impl Bridge {
                 };
 
                 match packet {
-                    Packet::Request(request) => request::handle_control(device, request, io).await,
-                    Packet::Data(packet) => transfer::handle_data(device, packet, io).await,
+                    Packet::Request(request) => {
+                        request::handle_control(device, request, io, pending).await
+                    }
+                    Packet::Data(packet) => {
+                        transfer::handle_data(device, packet, io, pending).await
+                    }
                     Packet::FilterFilter { rules: _ } => todo!(),
                     Packet::FilterReject => todo!(),
                     packet => {
@@ -71,7 +78,8 @@ impl Bridge {
         event: RedirEvent,
         io: &mut RdpeusbDeviceIo,
     ) -> anyhow::Result<Vec<Packet>> {
-        let device = match &mut self.state {
+        let Self { state, pending } = self;
+        let device = match state {
             BridgeState::Active(device) => device,
             BridgeState::AwaitingPeerHello(announce) => {
                 tracing::warn!(
@@ -85,7 +93,7 @@ impl Bridge {
                 return Ok(Vec::new());
             }
         };
-        transfer::handle_rdp_event(device, event, io).await
+        transfer::handle_rdp_event(device, event, io, pending).await
     }
 
     async fn handle_peer_hello(

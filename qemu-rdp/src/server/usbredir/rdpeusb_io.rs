@@ -41,9 +41,10 @@ impl RdpeusbDeviceIo {
         self.rx.recv().await
     }
 
-    /// Per USB redirection protocol v0.7: Control packets are handled synchroneously inside the
-    /// usb-host, it will hand the request over to the host os and then *wait* for a response. The
-    /// usb-host will thus stop processing further packets.
+    /// Per USB redirection protocol v0.7, protocol control packets such as
+    /// `usb_redir_set_configuration` are handled synchronously by the USB
+    /// host. Despite its name, `usb_redir_control_packet` is a data packet and
+    /// must use the outer completion pump instead of this wait path.
     ///
     /// Waits for one request's completion while preserving unrelated events.
     ///
@@ -184,11 +185,8 @@ impl RdpeusbDeviceIo {
     ///
     /// This is fire-and-forget: success only means the server event was
     /// accepted locally, not that the cancel PDU was written or acknowledged.
-    /// A canceled request does not produce a completion, so the bridge must
-    /// finish its corresponding usbredir request locally.
-    ///
-    /// IronRDP also needs to retire the server-side pending entry when it
-    /// sends the cancel; the qemu-rdp layer cannot repair that bookkeeping.
+    /// The original request remains pending until its normal RDPEUSB
+    /// completion reports whether completion or cancellation won the race.
     pub(super) fn cancel(&self, request_id: RequestId) -> anyhow::Result<()> {
         self.handle.cancel_request(request_id)
     }

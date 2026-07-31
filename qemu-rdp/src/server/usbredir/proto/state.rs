@@ -346,6 +346,46 @@ impl ActiveDevice {
         Ok(handle)
     }
 
+    /// Resolves an endpoint against the handles installed for the active
+    /// configuration and alternate settings.
+    ///
+    /// Endpoint addresses are unique within one active USB configuration, so
+    /// finding the same address in two interface bindings indicates an invalid
+    /// RDPEUSB selection result rather than an ambiguous routing choice.
+    pub(super) fn bulk_pipe_handle(&self, endpoint: Endpoint) -> anyhow::Result<PipeHandle> {
+        // Besides checking that the device is configured, this verifies that
+        // every live interface binding still matches the state announced to
+        // QEMU. Data must never be submitted through a stale pipe handle.
+        self.configuration_handle()?;
+        let BindingState::Configured(binding) = &self.binding else {
+            unreachable!("configuration_handle requires a configured binding")
+        };
+
+        let mut matching_pipe = None;
+        for interface in binding.interfaces.values() {
+            let InterfaceBindingState::Bound(interface) = interface else {
+                unreachable!("configuration_handle rejects unknown interface bindings")
+            };
+            let Some(pipe) = interface.pipes.get(&endpoint) else {
+                continue;
+            };
+            ensure!(
+                matching_pipe.replace(pipe).is_none(),
+                "endpoint {endpoint} is bound by multiple active USB interfaces"
+            );
+        }
+
+        let pipe = matching_pipe.with_context(|| {
+            format!("endpoint {endpoint} has no pipe in the active USB configuration")
+        })?;
+        ensure!(
+            pipe.pipe_type == UsbdPipeType::Bulk,
+            "endpoint {endpoint} is {:?}, not bulk",
+            pipe.pipe_type
+        );
+        Ok(pipe.handle)
+    }
+
     /// Returns the configuration handle usable by SELECT_INTERFACE.
     ///
     /// An interface-level `Unknown` state means a previous SELECT_INTERFACE
@@ -756,7 +796,7 @@ mod tests {
             },
         },
     };
-    use usbredir_proto::{Speed, TransferType};
+    use usbredir_proto::{Endpoint, Speed, TransferType};
 
     use super::super::{descriptor::ConfigurationDescriptor, device::PreparedDevice};
     use super::ActiveDevice;
@@ -834,6 +874,7 @@ mod tests {
         assert_eq!(device.configuration(), 0);
         assert_eq!(device.alt_setting(3), None);
         assert!(device.configuration_handle().is_err());
+        assert!(device.bulk_pipe_handle(Endpoint::from_raw(0x01)).is_err());
         let (ep_info, interface_info) = device.metadata();
         assert_eq!(interface_info.interface_count, 0);
         for (index, kind) in ep_info.ep_type.iter().enumerate() {
@@ -891,6 +932,12 @@ mod tests {
             .unwrap();
         assert_eq!(device.configuration(), 2);
         assert_eq!(device.configuration_handle().unwrap(), 0xcccc_0002);
+        assert_eq!(
+            device.bulk_pipe_handle(Endpoint::from_raw(0x01)).unwrap(),
+            0x0101_0001
+        );
+        assert!(device.bulk_pipe_handle(Endpoint::from_raw(0x81)).is_err());
+        assert!(device.bulk_pipe_handle(Endpoint::from_raw(0x02)).is_err());
 
         let alt_plan = device.plan_alt_setting(3, 1).unwrap();
         let request = alt_plan
@@ -938,6 +985,7 @@ mod tests {
             .unwrap();
         assert_eq!(device.alt_setting(3), Some(1));
         assert_eq!(device.configuration_handle().unwrap(), 0xcccc_0002);
+        assert!(device.bulk_pipe_handle(Endpoint::from_raw(0x01)).is_err());
 
         let unconfigure = device.plan_configuration(0).unwrap();
         let request = unconfigure.select_configuration_request().unwrap();
@@ -959,6 +1007,7 @@ mod tests {
             .unwrap();
         assert_eq!(device.configuration(), 0);
         assert!(device.configuration_handle().is_err());
+        assert!(device.bulk_pipe_handle(Endpoint::from_raw(0x01)).is_err());
         let (ep_info, interface_info) = device.metadata();
         assert_eq!(interface_info.interface_count, 0);
         for (index, kind) in ep_info.ep_type.iter().enumerate() {

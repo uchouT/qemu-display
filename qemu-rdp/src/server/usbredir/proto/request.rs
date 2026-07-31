@@ -3,12 +3,17 @@
 use usbredir_proto::{Packet, RequestKind, RequestPacket, Status};
 
 use super::super::rdpeusb_io::RdpeusbDeviceIo;
-use super::{device, device_metadata_packets, state::ActiveDevice};
+use super::{
+    device, device_metadata_packets,
+    state::ActiveDevice,
+    transfer::{self, PendingTransfers},
+};
 
 pub(super) async fn handle_control(
     active_device: &mut ActiveDevice,
     request: RequestPacket,
     io: &mut RdpeusbDeviceIo,
+    pending: &mut PendingTransfers,
 ) -> anyhow::Result<Vec<Packet>> {
     let RequestPacket { id, kind } = request;
 
@@ -71,10 +76,7 @@ pub(super) async fn handle_control(
             Status::Inval,
         )]),
         RequestKind::CancelDataPacket => {
-            tracing::debug!(
-                id,
-                "Ignored usbredir cancellation because no asynchronous transfer is registered"
-            );
+            transfer::cancel_data_packet(id, io, pending)?;
             Ok(Vec::new())
         }
         kind => {

@@ -1,9 +1,11 @@
 //! USB control-transfer translation between usbredir and RDPEUSB.
 
-use anyhow::ensure;
 use bytes::Bytes;
 use ironrdp_rdpeusb::{
-    io::{TransferInCompletionResult, TransferInPacket, TsUrbInKind, TsUrbInPacket, UrbFunction},
+    io::{
+        TransferInCompletionResult, TransferInPacket, TransferOutCompletionResult,
+        TransferOutPacket, TsUrbInKind, TsUrbInPacket, TsUrbOutKind, TsUrbOutPacket, UrbFunction,
+    },
     pdu::usb_dev::ts_urb::{
         TsUrbControlDescRequest, TsUrbControlFeatRequest, TsUrbControlGetConfigRequest,
         TsUrbControlGetInterfaceRequest, TsUrbControlGetStatusRequest,
@@ -12,10 +14,11 @@ use ironrdp_rdpeusb::{
 };
 use usbredir_proto::{DataKind, DataPacket, Endpoint, Packet, Status};
 
-use super::super::rdpeusb_io::RdpeusbDeviceIo;
+use super::super::{rdpeusb_io::RdpeusbDeviceIo, RdpeusbCompletionKind};
 use super::{
     descriptor::{self, ConfigurationDescriptor},
     state::ActiveDevice,
+    transfer::{completion_status, PendingTransfers},
 };
 
 const USB_DIRECTION_IN: u8 = 0x80;
@@ -41,7 +44,8 @@ const USB_REQUEST_GET_INTERFACE: u8 = 0x0a;
 // MS-RDPEUSB 2.2.9 uses bit zero for USBD_TRANSFER_DIRECTION_IN.
 const USBD_TRANSFER_DIRECTION_IN: u32 = 0x0000_0001;
 
-struct ControlRequest {
+#[derive(Debug)]
+pub(super) struct ControlRequest {
     id: u64,
     endpoint: Endpoint,
     request: u8,
@@ -52,15 +56,27 @@ struct ControlRequest {
     data: Bytes,
 }
 
+#[derive(Debug)]
+pub(super) enum PendingControl {
+    In(ControlRequest),
+    Out(ControlRequest),
+}
+
+enum RdpeusbControlRequest {
+    In(TransferInPacket),
+    Out(TransferOutPacket),
+}
+
 enum CacheableDescriptor {
     Device,
     Configuration(u8),
 }
 
 pub(super) async fn handle(
-    active_device: &mut ActiveDevice,
+    active_device: &ActiveDevice,
     packet: DataPacket,
-    io: &mut RdpeusbDeviceIo,
+    io: &RdpeusbDeviceIo,
+    pending: &mut PendingTransfers,
 ) -> anyhow::Result<Vec<Packet>> {
     let DataPacket {
         id,
@@ -125,50 +141,173 @@ pub(super) async fn handle(
         return Ok(vec![request.response(Status::Success, data)]);
     }
 
-    let packet = match io
-        .wait_transfer_in(transfer)
-        .await
-        .and_then(successful_transfer_in_output)
-    {
-        Ok(mut data) => {
-            data.truncate(usize::from(request.length));
-            if let Err(error) = request.cache_configuration_response(active_device, &data) {
-                // The transfer itself succeeded. A malformed descriptor must
-                // not rewrite that guest-visible result.
-                tracing::warn!(
-                    id,
-                    request = request.request,
-                    value = request.value,
-                    index = request.index,
-                    %error,
-                    "Did not cache a successful USB descriptor response"
-                );
-            }
-            tracing::trace!(
-                id,
-                actual_length = data.len(),
-                "Completed usbredir control request"
-            );
-            request.response(Status::Success, data)
-        }
+    // This await is only the RDPEUSB transport submission barrier. The device
+    // result is dispatched later by the outer SessionTask event pump.
+    let (sent, pending_control) = match transfer {
+        RdpeusbControlRequest::In(transfer) => (
+            io.handle().transfer_in_request(transfer).await,
+            PendingControl::In(request),
+        ),
+        RdpeusbControlRequest::Out(transfer) => (
+            io.handle().transfer_out_request(transfer).await,
+            PendingControl::Out(request),
+        ),
+    };
+    let sent = match sent {
+        Ok(sent) => sent,
         Err(error) => {
+            let request = pending_control.request();
             tracing::warn!(
-                id,
+                id = request.id,
                 request = request.request,
                 request_type = request.request_type,
                 %error,
-                "RDPEUSB control request failed"
+                "Failed to submit RDPEUSB control request"
             );
-            request.response(Status::IoError, Vec::new())
+            return Ok(vec![pending_control.response(Status::IoError, Vec::new())]);
         }
     };
+    if !sent.expects_completion {
+        let request = pending_control.request();
+        tracing::error!(
+            id = request.id,
+            request_id = sent.request_id,
+            "RDPEUSB control transfer unexpectedly has no completion"
+        );
+        return Ok(vec![pending_control.response(Status::IoError, Vec::new())]);
+    }
+    pending.insert_control(sent.request_id, pending_control)?;
 
-    Ok(vec![packet])
+    Ok(Vec::new())
+}
+
+pub(super) fn complete(
+    active_device: &mut ActiveDevice,
+    pending: PendingControl,
+    completion: RdpeusbCompletionKind,
+) -> Packet {
+    match (pending, completion) {
+        (PendingControl::In(request), RdpeusbCompletionKind::TransferIn(completion)) => {
+            complete_in(active_device, request, completion)
+        }
+        (PendingControl::Out(request), RdpeusbCompletionKind::TransferOut(completion)) => {
+            complete_out(request, completion)
+        }
+        (pending, completion) => {
+            tracing::error!(
+                id = pending.request().id,
+                completion_kind = completion.name(),
+                "RDPEUSB completion kind does not match usbredir control request"
+            );
+            pending.response(Status::IoError, Vec::new())
+        }
+    }
+}
+
+fn complete_in(
+    active_device: &mut ActiveDevice,
+    request: ControlRequest,
+    completion: TransferInCompletionResult,
+) -> Packet {
+    let status = completion_status(
+        completion.hresult,
+        completion.ts_urb_result.header.usbd_status,
+    );
+    if status != Status::Success {
+        tracing::warn!(
+            id = request.id,
+            request = request.request,
+            request_type = request.request_type,
+            hresult = completion.hresult,
+            usbd_status = completion.ts_urb_result.header.usbd_status,
+            ?status,
+            "RDPEUSB control request failed"
+        );
+        return request.response(status, Vec::new());
+    }
+
+    let mut data = completion.output_buffer;
+    data.truncate(usize::from(request.length));
+    if let Err(error) = request.cache_configuration_response(active_device, &data) {
+        // The transfer itself succeeded. A malformed descriptor must not
+        // rewrite that guest-visible result.
+        tracing::warn!(
+            id = request.id,
+            request = request.request,
+            value = request.value,
+            index = request.index,
+            %error,
+            "Did not cache a successful USB descriptor response"
+        );
+    }
+    tracing::trace!(
+        id = request.id,
+        actual_length = data.len(),
+        "Completed usbredir control request"
+    );
+    request.response(Status::Success, data)
+}
+
+fn complete_out(request: ControlRequest, completion: TransferOutCompletionResult) -> Packet {
+    let status = completion_status(
+        completion.hresult,
+        completion.ts_urb_result.header.usbd_status,
+    );
+    if status != Status::Success {
+        tracing::warn!(
+            id = request.id,
+            request = request.request,
+            request_type = request.request_type,
+            hresult = completion.hresult,
+            usbd_status = completion.ts_urb_result.header.usbd_status,
+            ?status,
+            "RDPEUSB control request failed"
+        );
+        return request.response(status, Vec::new());
+    }
+
+    if completion.output_buffer_size > u32::from(request.length) {
+        tracing::error!(
+            id = request.id,
+            requested_length = request.length,
+            actual_length = completion.output_buffer_size,
+            "RDPEUSB control OUT completion exceeds the submitted buffer"
+        );
+        return request.response(Status::IoError, Vec::new());
+    }
+
+    let actual_length = completion.output_buffer_size as u16;
+    tracing::trace!(
+        id = request.id,
+        actual_length,
+        "Completed usbredir control OUT request"
+    );
+    request.response_with_length(Status::Success, actual_length, Vec::new())
+}
+
+impl PendingControl {
+    pub(super) fn usbredir_id(&self) -> u64 {
+        self.request().id
+    }
+
+    fn request(&self) -> &ControlRequest {
+        match self {
+            Self::In(request) | Self::Out(request) => request,
+        }
+    }
+
+    fn response(&self, status: Status, data: Vec<u8>) -> Packet {
+        self.request().response(status, data)
+    }
 }
 
 impl ControlRequest {
     fn response(&self, status: Status, data: Vec<u8>) -> Packet {
         let length = u16::try_from(data.len()).unwrap_or(u16::MAX);
+        self.response_with_length(status, length, data)
+    }
+
+    fn response_with_length(&self, status: Status, length: u16, data: Vec<u8>) -> Packet {
         Packet::control_packet(
             self.id,
             self.endpoint,
@@ -226,10 +365,10 @@ impl ControlRequest {
     }
 }
 
-fn rdpeusb_request(request: &ControlRequest) -> Result<TransferInPacket, Status> {
+fn rdpeusb_request(request: &ControlRequest) -> Result<RdpeusbControlRequest, Status> {
     // Prefer the handle-free, operation-specific URBs used by MS-RDPEUSB
-    // 2.2.9.9 through 2.2.9.14. Unsupported requests will later fall back to
-    // a generic TS_URB_CONTROL_TRANSFER using the active device's current binding.
+    // 2.2.9.9 through 2.2.9.14. Requests without a typed translation are
+    // rejected until the generic TS_URB_CONTROL_TRANSFER fallback is added.
     let direction_in = request.request_type & USB_DIRECTION_IN != 0;
     if request.endpoint.number() != 0 || request.endpoint.is_input() != direction_in {
         return Err(Status::Inval);
@@ -326,13 +465,29 @@ fn rdpeusb_request(request: &ControlRequest) -> Result<TransferInPacket, Status>
                 func,
             )
         }
+        (false, USB_REQUEST_TYPE_CLASS | USB_REQUEST_TYPE_VENDOR, _, recipient) => {
+            let func = vendor_class_function(request_type, recipient).ok_or(Status::Stall)?;
+            return Ok(RdpeusbControlRequest::Out(TransferOutPacket {
+                ts_urb: TsUrbOutPacket {
+                    kind: TsUrbOutKind::VendorClassReq(TsUrbControlVendorClassRequest {
+                        transfer_flags: 0,
+                        request: request.request,
+                        value: request.value,
+                        index: request.index,
+                    }),
+                    no_ack: false,
+                    func,
+                },
+                output_buffer: request.data.to_vec(),
+            }));
+        }
         _ => return Err(Status::Stall),
     };
 
-    Ok(TransferInPacket {
+    Ok(RdpeusbControlRequest::In(TransferInPacket {
         ts_urb: TsUrbInPacket { kind, func },
         output_buffer_size,
-    })
+    }))
 }
 
 fn feature_function(request: u8, recipient: u8) -> Option<UrbFunction> {
@@ -393,20 +548,4 @@ fn vendor_class_function(request_type: u8, recipient: u8) -> Option<UrbFunction>
         }
         _ => None,
     }
-}
-
-fn successful_transfer_in_output(
-    completion: TransferInCompletionResult,
-) -> anyhow::Result<Vec<u8>> {
-    ensure!(
-        completion.hresult == 0,
-        "RDPEUSB transfer-in failed with HRESULT {:#010x}",
-        completion.hresult
-    );
-    ensure!(
-        completion.ts_urb_result.header.usbd_status == 0,
-        "USB transfer-in failed with USBD status {:#010x}",
-        completion.ts_urb_result.header.usbd_status
-    );
-    Ok(completion.output_buffer)
 }
