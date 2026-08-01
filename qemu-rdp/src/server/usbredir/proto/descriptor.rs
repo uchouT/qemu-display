@@ -310,6 +310,7 @@ impl ConfigurationDescriptor {
             configuration: self.configuration,
             attributes: self.attributes,
             max_power: self.max_power,
+            trailing: self.bytes[9..].to_vec(),
         }
     }
 
