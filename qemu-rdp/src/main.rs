@@ -57,19 +57,20 @@ fn print_capabilities() -> Result<(), anyhow::Error> {
 }
 
 fn setup_logging() -> anyhow::Result<()> {
-    use tracing::metadata::LevelFilter;
+use tracing::metadata::LevelFilter;
     use tracing_subscriber::{prelude::*, EnvFilter};
-
-    let fmt_layer = tracing_subscriber::fmt::layer().compact();
 
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
         .with_env_var("QEMURDP_LOG")
         .from_env_lossy();
+    let fmt_layer_with_filter = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_filter(env_filter);
 
-    tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(env_filter)
+    let result = tracing_subscriber::registry()
+        .with(console_subscriber::spawn())
+        .with(fmt_layer_with_filter)
         .try_init()
         .context("failed to set tracing global subscriber")?;
 

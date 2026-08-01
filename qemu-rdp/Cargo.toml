@@ -22,11 +22,12 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 bytes = "1.6"
 pixman-sys = "0.1.0"
 rustls-pemfile = "2.1"
-tokio = { version = "1.39", features = ["full"] }
+tokio = { version = "1.39", features = ["full", "tracing"] }
+console-subscriber = "0.5"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "cargo"] }
 async-trait = "0.1"
-ironrdp = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/urbdrc", features = [
+ironrdp = { path = "../../IronRDP/crates/ironrdp", features = [
     "connector",
     "server",
     "svc",
@@ -35,8 +36,8 @@ ironrdp = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/urbdrc"
     "rdpsnd",
     "qoiz",
 ] }
-ironrdp-server = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/urbdrc", features = ["helper", "usb"] }
-ironrdp-rdpeusb = { git = "https://github.com/uchouT/IronRDP.git", branch = "dev/urbdrc" }
+ironrdp-server = { path = "../../IronRDP/crates/ironrdp-server", features = ["helper", "usb"] }
+ironrdp-rdpeusb = { path = "../../IronRDP/crates/ironrdp-rdpeusb" }
 usbredir-proto = { git = "https://github.com/elmarco/usbredir-proto.git" }
 futures-util = "0.3"
 zbus.workspace = true
