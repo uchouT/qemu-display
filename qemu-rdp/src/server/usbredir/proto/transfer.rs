@@ -3,25 +3,13 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use ironrdp_rdpeusb::{
-    io::{
-        RequestId, TransferInPacket, TransferOutPacket, TsUrbInKind, TsUrbInPacket, TsUrbOutKind,
-        TsUrbOutPacket, UrbFunction,
-    },
-    pdu::{usb_dev::ts_urb::TsUrbBulkOrInterruptTransfer, utils::PipeHandle},
-};
+use ironrdp_rdpeusb::{io::RequestId, pdu::utils::PipeHandle, usb as rdpeusb};
 use usbredir_proto::{DataKind, DataPacket, Endpoint, Packet, Status};
 
 use super::super::{
     rdpeusb_io::RdpeusbDeviceIo, RdpeusbCompletion, RdpeusbCompletionKind, RedirEvent,
 };
 use super::{control_transfer, state::ActiveDevice};
-
-// WDK USBD_TRANSFER_DIRECTION_IN and USBD_SHORT_TRANSFER_OK. Short packets are
-// normal termination for bulk reads and must not turn a successful USB read
-// into an RDPEUSB error.
-const USBD_TRANSFER_DIRECTION_IN: u32 = 0x0000_0001;
-const USBD_SHORT_TRANSFER_OK: u32 = 0x0000_0002;
 
 // WDK USBD_STATUS values returned in TS_URB_RESULT_HEADER.
 const USBD_STATUS_CANCELED: u32 = 0xc001_0000;
@@ -61,11 +49,6 @@ struct PendingBulk {
     usbredir_id: u64,
     endpoint: Endpoint,
     stream_id: u32,
-}
-
-enum BulkRequest {
-    In(TransferInPacket),
-    Out(TransferOutPacket),
 }
 
 pub(super) async fn handle_data(
@@ -157,8 +140,8 @@ async fn handle_bulk(
     // completion arrives independently through RedirEvent and is dispatched by
     // the outer SessionTask select loop.
     let sent = match request {
-        BulkRequest::In(request) => io.handle().transfer_in_request(request).await,
-        BulkRequest::Out(request) => io.handle().transfer_out_request(request).await,
+        rdpeusb::TransferRequest::In(request) => io.handle().transfer_in_request(request).await,
+        rdpeusb::TransferRequest::Out(request) => io.handle().transfer_out_request(request).await,
     };
     let sent = match sent {
         Ok(sent) => sent,
@@ -186,37 +169,22 @@ fn build_bulk_request(
     pipe_handle: PipeHandle,
     length: u32,
     data: Bytes,
-) -> Result<BulkRequest, Status> {
-    let func = UrbFunction::URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER;
+) -> Result<rdpeusb::TransferRequest, Status> {
     if endpoint.is_input() {
         if !data.is_empty() {
             return Err(Status::Inval);
         }
-        Ok(BulkRequest::In(TransferInPacket {
-            ts_urb: TsUrbInPacket {
-                kind: TsUrbInKind::BulkInterruptTransfer(TsUrbBulkOrInterruptTransfer {
-                    pipe_handle,
-                    transfer_flags: USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK,
-                }),
-                func,
-            },
-            output_buffer_size: length,
-        }))
+        Ok(rdpeusb::TransferRequest::In(rdpeusb::bulk_or_interrupt_in(
+            pipe_handle,
+            length,
+        )))
     } else {
         if usize::try_from(length) != Ok(data.len()) {
             return Err(Status::Inval);
         }
-        Ok(BulkRequest::Out(TransferOutPacket {
-            ts_urb: TsUrbOutPacket {
-                kind: TsUrbOutKind::BulkInterruptTransfer(TsUrbBulkOrInterruptTransfer {
-                    pipe_handle,
-                    transfer_flags: 0,
-                }),
-                no_ack: false,
-                func,
-            },
-            output_buffer: data.to_vec(),
-        }))
+        Ok(rdpeusb::TransferRequest::Out(
+            rdpeusb::bulk_or_interrupt_out(pipe_handle, data.to_vec()),
+        ))
     }
 }
 

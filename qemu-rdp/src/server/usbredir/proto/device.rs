@@ -2,17 +2,18 @@
 
 use anyhow::{bail, ensure, Context as _};
 use ironrdp_rdpeusb::{
-    io::{
-        DeviceAnnounce, TransferInCompletionResult, TransferInPacket, TsUrbInKind, TsUrbInPacket,
-        UrbFunction,
-    },
+    io::{DeviceAnnounce, TransferInCompletionResult, TransferInPacket},
     pdu::{
         completion::ts_urb_result::{
             TsUrbResultPayload, TsUrbSelectConfigResult, TsUrbSelectInterfaceResult,
         },
         sink::DeviceSpeed,
-        usb_dev::ts_urb::{TsUrbControlDescRequest, TsUrbSelectConfig, TsUrbSelectInterface},
     },
+    usb as rdpeusb,
+};
+use ironrdp_usb::{
+    control::{GetDescriptorRequest, Recipient},
+    descriptor::descriptor_type,
 };
 use usbredir_proto::Speed;
 
@@ -32,7 +33,7 @@ pub(super) async fn prepare_device(
 ) -> anyhow::Result<PreparedDevice> {
     let device_descriptor_bytes = get_descriptor(
         io,
-        descriptor::DEVICE_DESCRIPTOR_TYPE,
+        descriptor_type::DEVICE,
         0,
         descriptor::DEVICE_DESCRIPTOR_SIZE,
     )
@@ -64,7 +65,7 @@ pub(super) async fn get_config_descriptor(
     for &index in indices {
         let header = get_descriptor(
             io,
-            descriptor::CONFIG_DESCRIPTOR_TYPE,
+            descriptor_type::CONFIGURATION,
             index,
             descriptor::CONFIG_DESCRIPTOR_SIZE,
         )
@@ -73,7 +74,7 @@ pub(super) async fn get_config_descriptor(
         let (total_length, configuration_value) = ConfigurationDescriptor::parse_header(&header)?;
 
         if configuration_value == configuration {
-            let bytes = get_descriptor(io, descriptor::CONFIG_DESCRIPTOR_TYPE, index, total_length)
+            let bytes = get_descriptor(io, descriptor_type::CONFIGURATION, index, total_length)
                 .await
                 .with_context(|| format!("query USB configuration descriptor {index}"))?;
             let descriptor = ConfigurationDescriptor::parse(&bytes)?;
@@ -90,16 +91,10 @@ pub(super) async fn get_config_descriptor(
 
 pub(super) async fn select_configuration(
     io: &mut RdpeusbDeviceIo,
-    request: TsUrbSelectConfig,
+    request: TransferInPacket,
 ) -> anyhow::Result<TsUrbSelectConfigResult> {
     let completion = io
-        .wait_transfer_in(TransferInPacket {
-            ts_urb: TsUrbInPacket {
-                kind: TsUrbInKind::SelectConfig(request),
-                func: UrbFunction::URB_FUNCTION_SELECT_CONFIGURATION,
-            },
-            output_buffer_size: 0,
-        })
+        .wait_transfer_in(request)
         .await
         .context("select USB configuration")?;
     ensure_successful_transfer_in(&completion)?;
@@ -115,16 +110,10 @@ pub(super) async fn select_configuration(
 
 pub(super) async fn select_interface(
     io: &mut RdpeusbDeviceIo,
-    request: TsUrbSelectInterface,
+    request: TransferInPacket,
 ) -> anyhow::Result<TsUrbSelectInterfaceResult> {
     let completion = io
-        .wait_transfer_in(TransferInPacket {
-            ts_urb: TsUrbInPacket {
-                kind: TsUrbInKind::SelectIface(request),
-                func: UrbFunction::URB_FUNCTION_SELECT_INTERFACE,
-            },
-            output_buffer_size: 0,
-        })
+        .wait_transfer_in(request)
         .await
         .context("select USB interface")?;
     ensure_successful_transfer_in(&completion)?;
@@ -144,21 +133,16 @@ async fn get_descriptor(
     index: u8,
     length: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    let output_buffer_size =
-        u32::try_from(length).context("USB descriptor request is too large")?;
-    let completion = io
-        .wait_transfer_in(TransferInPacket {
-            ts_urb: TsUrbInPacket {
-                kind: TsUrbInKind::CtlDescReq(TsUrbControlDescRequest {
-                    index,
-                    desc_type,
-                    lang_id: 0,
-                }),
-                func: UrbFunction::URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE,
-            },
-            output_buffer_size,
-        })
-        .await?;
+    let requested_length = u16::try_from(length).context("USB descriptor request is too large")?;
+    let request = rdpeusb::get_descriptor(GetDescriptorRequest {
+        recipient: Recipient::DEVICE,
+        descriptor_type: desc_type,
+        descriptor_index: index,
+        index: 0,
+        requested_length,
+    })
+    .map_err(|error| anyhow::anyhow!("cannot translate USB GET_DESCRIPTOR: {error}"))?;
+    let completion = io.wait_transfer_in(request).await?;
     successful_transfer_in_output(completion)
 }
 

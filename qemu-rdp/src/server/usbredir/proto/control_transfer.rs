@@ -2,47 +2,22 @@
 
 use bytes::Bytes;
 use ironrdp_rdpeusb::{
-    io::{
-        TransferInCompletionResult, TransferInPacket, TransferOutCompletionResult,
-        TransferOutPacket, TsUrbInKind, TsUrbInPacket, TsUrbOutKind, TsUrbOutPacket, UrbFunction,
-    },
-    pdu::usb_dev::ts_urb::{
-        TsUrbControlDescRequest, TsUrbControlFeatRequest, TsUrbControlGetConfigRequest,
-        TsUrbControlGetInterfaceRequest, TsUrbControlGetStatusRequest,
-        TsUrbControlVendorClassRequest,
-    },
+    io::{TransferInCompletionResult, TransferOutCompletionResult},
+    usb as rdpeusb,
+};
+use ironrdp_usb::{
+    control::{standard_request, Recipient, RequestKind, RequestType, SetupPacket},
+    descriptor::descriptor_type,
+    value::Direction,
 };
 use usbredir_proto::{DataKind, DataPacket, Endpoint, Packet, Status};
 
 use super::super::{rdpeusb_io::RdpeusbDeviceIo, RdpeusbCompletionKind};
 use super::{
-    descriptor::{self, ConfigurationDescriptor},
+    descriptor::ConfigurationDescriptor,
     state::ActiveDevice,
     transfer::{completion_status, PendingTransfers},
 };
-
-const USB_DIRECTION_IN: u8 = 0x80;
-const USB_REQUEST_TYPE_MASK: u8 = 0x60;
-const USB_REQUEST_TYPE_STANDARD: u8 = 0x00;
-const USB_REQUEST_TYPE_CLASS: u8 = 0x20;
-const USB_REQUEST_TYPE_VENDOR: u8 = 0x40;
-const USB_RECIPIENT_MASK: u8 = 0x1f;
-const USB_RECIPIENT_DEVICE: u8 = 0;
-const USB_RECIPIENT_INTERFACE: u8 = 1;
-const USB_RECIPIENT_ENDPOINT: u8 = 2;
-const USB_RECIPIENT_OTHER: u8 = 3;
-const USB_STANDARD_DEVICE_IN: u8 =
-    USB_DIRECTION_IN | USB_REQUEST_TYPE_STANDARD | USB_RECIPIENT_DEVICE;
-
-const USB_REQUEST_GET_STATUS: u8 = 0x00;
-const USB_REQUEST_CLEAR_FEATURE: u8 = 0x01;
-const USB_REQUEST_SET_FEATURE: u8 = 0x03;
-const USB_REQUEST_GET_DESCRIPTOR: u8 = 0x06;
-const USB_REQUEST_GET_CONFIGURATION: u8 = 0x08;
-const USB_REQUEST_GET_INTERFACE: u8 = 0x0a;
-
-// MS-RDPEUSB 2.2.9 uses bit zero for USBD_TRANSFER_DIRECTION_IN.
-const USBD_TRANSFER_DIRECTION_IN: u32 = 0x0000_0001;
 
 #[derive(Debug)]
 pub(super) struct ControlRequest {
@@ -60,11 +35,6 @@ pub(super) struct ControlRequest {
 pub(super) enum PendingControl {
     In(ControlRequest),
     Out(ControlRequest),
-}
-
-enum RdpeusbControlRequest {
-    In(TransferInPacket),
-    Out(TransferOutPacket),
 }
 
 enum CacheableDescriptor {
@@ -144,11 +114,11 @@ pub(super) async fn handle(
     // This await is only the RDPEUSB transport submission barrier. The device
     // result is dispatched later by the outer SessionTask event pump.
     let (sent, pending_control) = match transfer {
-        RdpeusbControlRequest::In(transfer) => (
+        rdpeusb::TransferRequest::In(transfer) => (
             io.handle().transfer_in_request(transfer).await,
             PendingControl::In(request),
         ),
-        RdpeusbControlRequest::Out(transfer) => (
+        rdpeusb::TransferRequest::Out(transfer) => (
             io.handle().transfer_out_request(transfer).await,
             PendingControl::Out(request),
         ),
@@ -322,8 +292,11 @@ impl ControlRequest {
     }
 
     fn cacheable_descriptor(&self) -> Option<CacheableDescriptor> {
-        if self.request_type != USB_STANDARD_DEVICE_IN
-            || self.request != USB_REQUEST_GET_DESCRIPTOR
+        let request_type = RequestType::from_raw(self.request_type);
+        if request_type.direction() != Direction::In
+            || request_type.kind() != RequestKind::STANDARD
+            || request_type.recipient() != Recipient::DEVICE
+            || self.request != standard_request::GET_DESCRIPTOR
             || self.index != 0
         {
             return None;
@@ -331,8 +304,8 @@ impl ControlRequest {
 
         let [index, descriptor_type] = self.value.to_le_bytes();
         match (descriptor_type, index) {
-            (descriptor::DEVICE_DESCRIPTOR_TYPE, 0) => Some(CacheableDescriptor::Device),
-            (descriptor::CONFIG_DESCRIPTOR_TYPE, index) => {
+            (descriptor_type::DEVICE, 0) => Some(CacheableDescriptor::Device),
+            (descriptor_type::CONFIGURATION, index) => {
                 Some(CacheableDescriptor::Configuration(index))
             }
             _ => None,
@@ -365,187 +338,23 @@ impl ControlRequest {
     }
 }
 
-fn rdpeusb_request(request: &ControlRequest) -> Result<RdpeusbControlRequest, Status> {
-    // Prefer the handle-free, operation-specific URBs used by MS-RDPEUSB
-    // 2.2.9.9 through 2.2.9.14. Requests without a typed translation are
-    // rejected until the generic TS_URB_CONTROL_TRANSFER fallback is added.
-    let direction_in = request.request_type & USB_DIRECTION_IN != 0;
+fn rdpeusb_request(request: &ControlRequest) -> Result<rdpeusb::TransferRequest, Status> {
+    let setup = SetupPacket {
+        request_type: RequestType::from_raw(request.request_type),
+        request: request.request,
+        value: request.value,
+        index: request.index,
+        length: request.length,
+    };
+    let direction_in = setup.request_type.direction() == Direction::In;
     if request.endpoint.number() != 0 || request.endpoint.is_input() != direction_in {
         return Err(Status::Inval);
     }
-    if direction_in {
-        if !request.data.is_empty() {
-            return Err(Status::Inval);
-        }
-    } else if request.data.len() != usize::from(request.length) {
-        return Err(Status::Inval);
-    }
 
-    let request_type = request.request_type & USB_REQUEST_TYPE_MASK;
-    let recipient = request.request_type & USB_RECIPIENT_MASK;
-    let output_buffer_size = u32::from(request.length);
-
-    let (kind, func) = match (direction_in, request_type, request.request, recipient) {
-        (true, USB_REQUEST_TYPE_STANDARD, USB_REQUEST_GET_DESCRIPTOR, recipient) => {
-            let func = match recipient {
-                USB_RECIPIENT_DEVICE => UrbFunction::URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE,
-                USB_RECIPIENT_INTERFACE => UrbFunction::URB_FUNCTION_GET_DESCRIPTOR_FROM_INTERFACE,
-                USB_RECIPIENT_ENDPOINT => UrbFunction::URB_FUNCTION_GET_DESCRIPTOR_FROM_ENDPOINT,
-                _ => return Err(Status::Stall),
-            };
-            let [index, desc_type] = request.value.to_le_bytes();
-            (
-                TsUrbInKind::CtlDescReq(TsUrbControlDescRequest {
-                    index,
-                    desc_type,
-                    lang_id: request.index,
-                }),
-                func,
-            )
-        }
-        (true, USB_REQUEST_TYPE_STANDARD, USB_REQUEST_GET_STATUS, recipient)
-            if request.length == 2 =>
-        {
-            let func = match recipient {
-                USB_RECIPIENT_DEVICE => UrbFunction::URB_FUNCTION_GET_STATUS_FROM_DEVICE,
-                USB_RECIPIENT_INTERFACE => UrbFunction::URB_FUNCTION_GET_STATUS_FROM_INTERFACE,
-                USB_RECIPIENT_ENDPOINT => UrbFunction::URB_FUNCTION_GET_STATUS_FROM_ENDPOINT,
-                USB_RECIPIENT_OTHER => UrbFunction::URB_FUNCTION_GET_STATUS_FROM_OTHER,
-                _ => return Err(Status::Stall),
-            };
-            (
-                TsUrbInKind::CtlGetStatus(TsUrbControlGetStatusRequest {
-                    index: request.index,
-                }),
-                func,
-            )
-        }
-        (
-            false,
-            USB_REQUEST_TYPE_STANDARD,
-            USB_REQUEST_CLEAR_FEATURE | USB_REQUEST_SET_FEATURE,
-            recipient,
-        ) if request.length == 0 => {
-            let func = feature_function(request.request, recipient).ok_or(Status::Stall)?;
-            (
-                TsUrbInKind::CtlFeatReq(TsUrbControlFeatRequest {
-                    feat_selector: request.value,
-                    index: request.index,
-                }),
-                func,
-            )
-        }
-        (true, USB_REQUEST_TYPE_STANDARD, USB_REQUEST_GET_CONFIGURATION, USB_RECIPIENT_DEVICE)
-            if request.length == 1 =>
-        {
-            (
-                TsUrbInKind::CtlGetConfig(TsUrbControlGetConfigRequest),
-                UrbFunction::URB_FUNCTION_GET_CONFIGURATION,
-            )
-        }
-        (true, USB_REQUEST_TYPE_STANDARD, USB_REQUEST_GET_INTERFACE, USB_RECIPIENT_INTERFACE)
-            if request.length == 1 =>
-        {
-            (
-                TsUrbInKind::CtlGetIface(TsUrbControlGetInterfaceRequest {
-                    interface: request.index,
-                }),
-                UrbFunction::URB_FUNCTION_GET_INTERFACE,
-            )
-        }
-        (true, USB_REQUEST_TYPE_CLASS | USB_REQUEST_TYPE_VENDOR, _, recipient) => {
-            let func = vendor_class_function(request_type, recipient).ok_or(Status::Stall)?;
-            (
-                TsUrbInKind::VendorClassReq(TsUrbControlVendorClassRequest {
-                    transfer_flags: USBD_TRANSFER_DIRECTION_IN,
-                    request: request.request,
-                    value: request.value,
-                    index: request.index,
-                }),
-                func,
-            )
-        }
-        (false, USB_REQUEST_TYPE_CLASS | USB_REQUEST_TYPE_VENDOR, _, recipient) => {
-            let func = vendor_class_function(request_type, recipient).ok_or(Status::Stall)?;
-            return Ok(RdpeusbControlRequest::Out(TransferOutPacket {
-                ts_urb: TsUrbOutPacket {
-                    kind: TsUrbOutKind::VendorClassReq(TsUrbControlVendorClassRequest {
-                        transfer_flags: 0,
-                        request: request.request,
-                        value: request.value,
-                        index: request.index,
-                    }),
-                    no_ack: false,
-                    func,
-                },
-                output_buffer: request.data.to_vec(),
-            }));
-        }
-        _ => return Err(Status::Stall),
-    };
-
-    Ok(RdpeusbControlRequest::In(TransferInPacket {
-        ts_urb: TsUrbInPacket { kind, func },
-        output_buffer_size,
-    }))
-}
-
-fn feature_function(request: u8, recipient: u8) -> Option<UrbFunction> {
-    match (request, recipient) {
-        (USB_REQUEST_CLEAR_FEATURE, USB_RECIPIENT_DEVICE) => {
-            Some(UrbFunction::URB_FUNCTION_CLEAR_FEATURE_TO_DEVICE)
-        }
-        (USB_REQUEST_CLEAR_FEATURE, USB_RECIPIENT_INTERFACE) => {
-            Some(UrbFunction::URB_FUNCTION_CLEAR_FEATURE_TO_INTERFACE)
-        }
-        (USB_REQUEST_CLEAR_FEATURE, USB_RECIPIENT_ENDPOINT) => {
-            Some(UrbFunction::URB_FUNCTION_CLEAR_FEATURE_TO_ENDPOINT)
-        }
-        (USB_REQUEST_CLEAR_FEATURE, USB_RECIPIENT_OTHER) => {
-            Some(UrbFunction::URB_FUNCTION_CLEAR_FEATURE_TO_OTHER)
-        }
-        (USB_REQUEST_SET_FEATURE, USB_RECIPIENT_DEVICE) => {
-            Some(UrbFunction::URB_FUNCTION_SET_FEATURE_TO_DEVICE)
-        }
-        (USB_REQUEST_SET_FEATURE, USB_RECIPIENT_INTERFACE) => {
-            Some(UrbFunction::URB_FUNCTION_SET_FEATURE_TO_INTERFACE)
-        }
-        (USB_REQUEST_SET_FEATURE, USB_RECIPIENT_ENDPOINT) => {
-            Some(UrbFunction::URB_FUNCTION_SET_FEATURE_TO_ENDPOINT)
-        }
-        (USB_REQUEST_SET_FEATURE, USB_RECIPIENT_OTHER) => {
-            Some(UrbFunction::URB_FUNCTION_SET_FEATURE_TO_OTHER)
-        }
-        _ => None,
-    }
-}
-
-fn vendor_class_function(request_type: u8, recipient: u8) -> Option<UrbFunction> {
-    match (request_type, recipient) {
-        (USB_REQUEST_TYPE_VENDOR, USB_RECIPIENT_DEVICE) => {
-            Some(UrbFunction::URB_FUNCTION_VENDOR_DEVICE)
-        }
-        (USB_REQUEST_TYPE_VENDOR, USB_RECIPIENT_INTERFACE) => {
-            Some(UrbFunction::URB_FUNCTION_VENDOR_INTERFACE)
-        }
-        (USB_REQUEST_TYPE_VENDOR, USB_RECIPIENT_ENDPOINT) => {
-            Some(UrbFunction::URB_FUNCTION_VENDOR_ENDPOINT)
-        }
-        (USB_REQUEST_TYPE_VENDOR, USB_RECIPIENT_OTHER) => {
-            Some(UrbFunction::URB_FUNCTION_VENDOR_OTHER)
-        }
-        (USB_REQUEST_TYPE_CLASS, USB_RECIPIENT_DEVICE) => {
-            Some(UrbFunction::URB_FUNCTION_CLASS_DEVICE)
-        }
-        (USB_REQUEST_TYPE_CLASS, USB_RECIPIENT_INTERFACE) => {
-            Some(UrbFunction::URB_FUNCTION_CLASS_INTERFACE)
-        }
-        (USB_REQUEST_TYPE_CLASS, USB_RECIPIENT_ENDPOINT) => {
-            Some(UrbFunction::URB_FUNCTION_CLASS_ENDPOINT)
-        }
-        (USB_REQUEST_TYPE_CLASS, USB_RECIPIENT_OTHER) => {
-            Some(UrbFunction::URB_FUNCTION_CLASS_OTHER)
-        }
-        _ => None,
-    }
+    rdpeusb::control_transfer(setup, request.data.to_vec()).map_err(|error| match error {
+        rdpeusb::ConversionError::InTransferHasData { .. }
+        | rdpeusb::ConversionError::OutTransferLengthMismatch { .. } => Status::Inval,
+        rdpeusb::ConversionError::StatefulStandardRequest { .. } => Status::Stall,
+        _ => Status::IoError,
+    })
 }

@@ -4,15 +4,16 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{ensure, Context as _};
 use ironrdp_rdpeusb::{
-    io::DeviceAnnounce,
+    io::{DeviceAnnounce, TransferInPacket},
     pdu::{
         completion::ts_urb_result::{
             TsUrbSelectConfigResult, TsUrbSelectInterfaceResult, UsbdPipeType,
         },
-        usb_dev::ts_urb::{TsUrbSelectConfig, TsUrbSelectInterface},
         utils::{ConfigHandle, PipeHandle},
     },
+    usb as rdpeusb,
 };
+use ironrdp_usb::value::{InterfaceSelection as UsbInterfaceSelection, UsbSpeed};
 use usbredir_proto::{DeviceConnectInfo, Endpoint, EpInfoData, InterfaceInfoData, Speed};
 
 use super::{
@@ -107,6 +108,7 @@ pub(super) struct PipeBinding {
 pub(super) struct ConfigurationPlan {
     selection: DeviceSelection,
     descriptor: Option<ConfigurationDescriptor>,
+    usb_speed: UsbSpeed,
     interface_info: InterfaceInfoData,
     ep_info: EpInfoData,
 }
@@ -479,7 +481,12 @@ impl ActiveDevice {
                         interface.interface_number
                     )
                 })?;
-            descriptor.validate_interface_result(interface.interface_number, alt, &interface)?;
+            descriptor.validate_interface_result(
+                interface.interface_number,
+                alt,
+                plan.usb_speed,
+                &interface,
+            )?;
             let number = interface.interface_number;
             ensure!(
                 interfaces
@@ -574,7 +581,7 @@ impl ActiveDevice {
             .as_ref()
             .context("alternate-setting plan has no configuration descriptor")?;
         let alt = plan.alt_setting(interface)?;
-        descriptor.validate_interface_result(interface, alt, &result.interface)?;
+        descriptor.validate_interface_result(interface, alt, plan.usb_speed, &result.interface)?;
         InterfaceBinding::from_result(result.interface, token.generation)
     }
 
@@ -692,9 +699,11 @@ impl ConfigurationPlan {
             &selection.active_interfaces,
             speed,
         )?;
+        let usb_speed = descriptor::usb_speed(speed)?;
         Ok(Self {
             selection,
             descriptor,
+            usb_speed,
             interface_info,
             ep_info,
         })
@@ -708,32 +717,42 @@ impl ConfigurationPlan {
             .with_context(|| format!("USB interface {interface} is not in selection plan"))
     }
 
-    pub(super) fn select_configuration_request(&self) -> anyhow::Result<TsUrbSelectConfig> {
-        let Some(descriptor) = &self.descriptor else {
-            return Ok(TsUrbSelectConfig {
-                usbd_ifaces: Vec::new(),
-                desc: None,
-            });
-        };
-        Ok(TsUrbSelectConfig {
-            usbd_ifaces: descriptor.rdpeusb_interfaces(&self.selection.active_interfaces)?,
-            desc: Some(descriptor.rdpeusb_config_descriptor()),
-        })
+    pub(super) fn select_configuration_request(&self) -> anyhow::Result<TransferInPacket> {
+        let active_interfaces = self
+            .selection
+            .active_interfaces
+            .iter()
+            .map(|&(interface, alternate_setting)| UsbInterfaceSelection {
+                interface,
+                alternate_setting,
+            })
+            .collect::<Vec<_>>();
+        rdpeusb::select_configuration(
+            self.descriptor.as_ref().map(ConfigurationDescriptor::view),
+            &active_interfaces,
+            self.usb_speed,
+        )
+        .map_err(|error| anyhow::anyhow!("cannot translate USB configuration selection: {error}"))
     }
 
     pub(super) fn select_interface_request(
         &self,
         config_handle: ConfigHandle,
         interface: u8,
-    ) -> anyhow::Result<TsUrbSelectInterface> {
+    ) -> anyhow::Result<TransferInPacket> {
         let descriptor = self
             .descriptor
             .as_ref()
             .context("alternate-setting plan has no configuration descriptor")?;
-        Ok(TsUrbSelectInterface {
-            config_handle,
-            usbd_iface: descriptor.rdpeusb_interface(interface, self.alt_setting(interface)?)?,
-        })
+        let alternate_setting = self.alt_setting(interface)?;
+        let interface = descriptor
+            .view()
+            .interface(interface, alternate_setting)
+            .with_context(|| {
+                format!("USB interface {interface} has no alternate setting {alternate_setting}")
+            })?;
+        rdpeusb::select_interface(config_handle, interface, self.usb_speed)
+            .map_err(|error| anyhow::anyhow!("cannot translate USB interface selection: {error}"))
     }
 
     fn into_announced(self, revision: u64) -> AnnouncedView {
@@ -784,7 +803,7 @@ impl InterfaceBinding {
 #[cfg(test)]
 mod tests {
     use ironrdp_rdpeusb::{
-        io::DeviceAnnounce,
+        io::{DeviceAnnounce, TsUrbInKind},
         pdu::{
             completion::ts_urb_result::{
                 TsUrbSelectConfigResult, TsUrbSelectInterfaceResult, TsUsbdInterfaceInfoResult,
@@ -895,6 +914,9 @@ mod tests {
 
         let config_plan = device.plan_configuration(2).unwrap();
         let request = config_plan.select_configuration_request().unwrap();
+        let TsUrbInKind::SelectConfig(request) = request.ts_urb.kind else {
+            panic!("configuration plan did not produce SELECT_CONFIGURATION")
+        };
         assert_eq!(request.desc.unwrap().configuration_value, 2);
         let config_result = TsUrbSelectConfigResult {
             config_handle: 0xcccc_0002,
@@ -943,6 +965,9 @@ mod tests {
         let request = alt_plan
             .select_interface_request(device.configuration_handle().unwrap(), 3)
             .unwrap();
+        let TsUrbInKind::SelectIface(request) = request.ts_urb.kind else {
+            panic!("alternate-setting plan did not produce SELECT_INTERFACE")
+        };
         assert_eq!(request.config_handle, 0xcccc_0002);
         assert_eq!(request.usbd_iface.alternate_setting, 1);
         let _abandoned_token = device.begin_interface_selection(3).unwrap();
@@ -989,6 +1014,9 @@ mod tests {
 
         let unconfigure = device.plan_configuration(0).unwrap();
         let request = unconfigure.select_configuration_request().unwrap();
+        let TsUrbInKind::SelectConfig(request) = request.ts_urb.kind else {
+            panic!("unconfigure plan did not produce SELECT_CONFIGURATION")
+        };
         assert!(request.desc.is_none());
         assert!(request.usbd_ifaces.is_empty());
         let token = device.begin_configuration_selection().unwrap();
