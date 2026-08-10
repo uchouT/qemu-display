@@ -1,15 +1,11 @@
 use std::os::unix::net::UnixStream;
 
-use ironrdp_rdpeusb::{
-    io::{
-        DeviceAnnounce, DeviceText, IoControlCompletionResult, RequestId,
-        TransferInCompletionResult, TransferOutCompletionResult,
-    },
-    server::UrbdrcDeviceServerBackend,
-};
-use ironrdp_server::{DeviceFactory, UsbDeviceHandle};
+use ironrdp_server::{DeviceFactory, DeviceText, RdpUsbDeviceAnnounceInfo, UsbRedirDevice};
 use qemu_display::UsbRedir;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 
 mod proto;
 mod rdpeusb_io;
@@ -33,87 +29,47 @@ impl QemuUsbFactory {
 }
 
 impl DeviceFactory for QemuUsbFactory {
-    fn create_device(
-        &mut self,
-        handle: UsbDeviceHandle,
-    ) -> Option<Box<dyn UrbdrcDeviceServerBackend>> {
+    fn create_device(&mut self) -> Option<Box<dyn ironrdp_server::UsbRedirDevice>> {
         Some(Box::new(RdpUsbRedirDeviceBackend::new(
             self.usbredir.clone(),
-            handle,
         )))
     }
 }
 
 struct RdpUsbRedirDeviceBackend {
     usbredir: UsbRedir<RdpUsb>,
-    rdp_handle: UsbDeviceHandle,
     sender: Option<UnboundedSender<RedirEvent>>,
 }
 
+/// Usbredir device session event.
 #[derive(Debug)]
 enum RedirEvent {
     DeviceText(DeviceText),
-    Completion(RdpeusbCompletion),
-}
-
-#[derive(Debug)]
-struct RdpeusbCompletion {
-    channel_id: u32,
-    request_id: RequestId,
-    kind: RdpeusbCompletionKind,
-}
-
-#[derive(Debug)]
-enum RdpeusbCompletionKind {
-    IoControl(IoControlCompletionResult),
-    InternalIoControl(IoControlCompletionResult),
-    TransferIn(TransferInCompletionResult),
-    TransferOut(TransferOutCompletionResult),
+    Close,
 }
 
 impl RedirEvent {
     fn kind_name(&self) -> &'static str {
         match self {
             Self::DeviceText(_) => "device-text",
-            Self::Completion(completion) => completion.kind.name(),
-        }
-    }
-
-    fn request_id(&self) -> Option<RequestId> {
-        match self {
-            Self::DeviceText(_) => None,
-            Self::Completion(completion) => Some(completion.request_id),
-        }
-    }
-}
-
-impl RdpeusbCompletionKind {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::IoControl(_) => "io-control",
-            Self::InternalIoControl(_) => "internal-io-control",
-            Self::TransferIn(_) => "transfer-in",
-            Self::TransferOut(_) => "transfer-out",
+            Self::Close => "close",
         }
     }
 }
 
 impl RdpUsbRedirDeviceBackend {
-    fn new(usbredir: UsbRedir<RdpUsb>, rdp_handle: UsbDeviceHandle) -> Self {
+    fn new(usbredir: UsbRedir<RdpUsb>) -> Self {
         Self {
             usbredir,
-            rdp_handle,
             sender: None,
         }
     }
 
     fn send_event(&self, event: RedirEvent) {
         let event_kind = event.kind_name();
-        let request_id = event.request_id();
         let Some(sender) = &self.sender else {
             tracing::warn!(
                 event_kind,
-                ?request_id,
                 "received an RDPEUSB event before the usbredir device session started"
             );
             return;
@@ -122,122 +78,63 @@ impl RdpUsbRedirDeviceBackend {
         if sender.send(event).is_err() {
             tracing::trace!(
                 event_kind,
-                ?request_id,
                 "discarded an RDPEUSB event after the usbredir device session stopped"
             );
         }
     }
 }
 
-struct RedirTask {
-    usbredir: UsbRedir<RdpUsb>,
-    rdp_handle: UsbDeviceHandle,
-    rx: UnboundedReceiver<RedirEvent>,
-}
-
-impl RedirTask {
-    fn new(
-        usbredir: UsbRedir<RdpUsb>,
-        rdp_handle: UsbDeviceHandle,
-        rx: UnboundedReceiver<RedirEvent>,
-    ) -> Self {
-        Self {
-            usbredir,
-            rdp_handle,
-            rx,
-        }
-    }
-
-    async fn start(self, announce: DeviceAnnounce) -> anyhow::Result<()> {
-        let key = announce.device_instance_id.clone();
-        let device = RdpUsbRedirDevice::new(announce, self.rdp_handle, self.rx);
-
-        tracing::debug!(%key, "connecting RDPEUSB device to QEMU usbredir chardev");
-        let connected = self.usbredir.connect_device(key.clone(), device).await?;
-        tracing::debug!(%key, connected, "QEMU usbredir device connection completed");
-        Ok(())
-    }
-}
-
-impl UrbdrcDeviceServerBackend for RdpUsbRedirDeviceBackend {
-    fn add_device(&mut self, device: DeviceAnnounce) -> ironrdp::pdu::PduResult<()> {
+impl UsbRedirDevice for RdpUsbRedirDeviceBackend {
+    fn device_added(&mut self, info: RdpUsbDeviceAnnounceInfo) {
         if self.sender.is_some() {
             tracing::debug!("ignoring duplicate RDPEUSB device announcement");
-            return Ok(());
+            // TODO: make this trait method return Result
+            return;
         }
         tracing::debug!(
-            device_instance_id = %device.device_instance_id,
+            device_instance_id = %info.announce.device_instance_id,
             "starting usbredir device session"
         );
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.sender = Some(tx);
-        let task = RedirTask::new(self.usbredir.clone(), self.rdp_handle.clone(), rx);
-        tokio::spawn(async {
-            if let Err(e) = task.start(device).await {
-                tracing::error!("task failed: {e}")
+        let (end_tx, end_rx) = oneshot::channel();
+
+        let device = RdpUsbRedirDevice::new(info, rx, end_tx);
+        let key = device.key().to_string();
+        let usbredir = self.usbredir.clone();
+
+        tokio::spawn(async move {
+            tracing::debug!(%key, "connecting RDPEUSB device to QEMU usbredir chardev");
+            if let Err(error) = usbredir.connect_device(key.clone(), device).await {
+                tracing::error!(%key, ?error, "USB redirection connect task failed");
+            }
+
+            // Wakes once the session task drops its sender end: normal exit,
+            // failure, and abort alike. A failed connect above has already
+            // dropped it.
+            let _ = end_rx.await;
+            match usbredir.disconnect_device(&key).await {
+                Ok(_) => tracing::debug!(%key, "released usbredir device session"),
+                Err(error) => {
+                    tracing::warn!(%key, ?error, "failed to disconnect usbredir device")
+                }
             }
         });
-        Ok(())
     }
 
     fn device_text(&mut self, device_text: DeviceText) {
         self.send_event(RedirEvent::DeviceText(device_text));
     }
 
-    fn io_control_completed(
-        &mut self,
-        channel_id: u32,
-        request_id: RequestId,
-        completion: IoControlCompletionResult,
-    ) -> ironrdp::pdu::PduResult<()> {
-        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
-            channel_id,
-            request_id,
-            kind: RdpeusbCompletionKind::IoControl(completion),
-        }));
-        Ok(())
-    }
-
-    fn internal_io_control_completed(
-        &mut self,
-        channel_id: u32,
-        request_id: RequestId,
-        completion: IoControlCompletionResult,
-    ) -> ironrdp::pdu::PduResult<()> {
-        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
-            channel_id,
-            request_id,
-            kind: RdpeusbCompletionKind::InternalIoControl(completion),
-        }));
-        Ok(())
-    }
-
-    fn transfer_in_completed(
-        &mut self,
-        channel_id: u32,
-        request_id: RequestId,
-        completion: TransferInCompletionResult,
-    ) -> ironrdp::pdu::PduResult<()> {
-        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
-            channel_id,
-            request_id,
-            kind: RdpeusbCompletionKind::TransferIn(completion),
-        }));
-        Ok(())
-    }
-
-    fn transfer_out_completed(
-        &mut self,
-        channel_id: u32,
-        request_id: RequestId,
-        completion: TransferOutCompletionResult,
-    ) -> ironrdp::pdu::PduResult<()> {
-        self.send_event(RedirEvent::Completion(RdpeusbCompletion {
-            channel_id,
-            request_id,
-            kind: RdpeusbCompletionKind::TransferOut(completion),
-        }));
-        Ok(())
+    fn close(&mut self) {
+        if self.sender.is_none() {
+            // Legal path: the device channel died before ADD_DEVICE arrived,
+            // so no usbredir session was ever started.
+            tracing::debug!("RDPEUSB device closed before a usbredir session started");
+            return;
+        }
+        self.send_event(RedirEvent::Close);
     }
 }
 
@@ -259,33 +156,33 @@ impl qemu_display::UsbRedirBackend for RdpUsb {
 }
 
 struct RdpUsbRedirDevice {
-    announce: DeviceAnnounce,
-    rdp_handle: UsbDeviceHandle,
+    info: RdpUsbDeviceAnnounceInfo,
     rx: UnboundedReceiver<RedirEvent>,
+    /// Dropped when the session task ends, waking the supervisor spawned in
+    /// `device_added` to release the chardev slot.
+    end_tx: oneshot::Sender<()>,
 }
 
 impl RdpUsbRedirDevice {
     fn new(
-        announce: DeviceAnnounce,
-        rdp_handle: UsbDeviceHandle,
+        info: RdpUsbDeviceAnnounceInfo,
         rx: UnboundedReceiver<RedirEvent>,
+        end_tx: oneshot::Sender<()>,
     ) -> Self {
-        Self {
-            announce,
-            rdp_handle,
-            rx,
-        }
+        Self { info, rx, end_tx }
+    }
+
+    fn key(&self) -> &str {
+        &self.info.announce.device_instance_id
     }
 }
 
 struct RdpUsbSession {
     task: tokio::task::JoinHandle<()>,
-    handle: UsbDeviceHandle,
 }
 
 impl RdpUsbSession {
     async fn new(device: RdpUsbRedirDevice, stream: UnixStream) -> qemu_display::Result<Self> {
-        let handle = device.rdp_handle.clone();
         let task = session_task::SessionTask::new(device, stream)?;
         let task = tokio::spawn(async move {
             if let Err(error) = task.run().await {
@@ -293,15 +190,12 @@ impl RdpUsbSession {
             }
         });
 
-        Ok(Self { task, handle })
+        Ok(Self { task })
     }
 }
 
 impl Drop for RdpUsbSession {
     fn drop(&mut self) {
-        // TODO: handle session close
-        //
-        // let _ = self.handle.retract_request(reason);
         self.task.abort();
     }
 }

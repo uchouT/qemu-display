@@ -13,6 +13,9 @@ pub(super) struct SessionTask {
     parser: Parser<Host>,
     bridge: proto::Bridge,
     io: RdpeusbDeviceIo,
+    /// Dropped when the session ends, waking the device supervisor to release
+    /// the chardev slot.
+    _end_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 impl SessionTask {
@@ -20,11 +23,7 @@ impl SessionTask {
         stream.set_nonblocking(true)?;
         let stream = tokio::net::UnixStream::from_std(stream)?;
 
-        let RdpUsbRedirDevice {
-            announce,
-            rdp_handle,
-            rx,
-        } = device;
+        let RdpUsbRedirDevice { info, rx, end_tx } = device;
 
         let parser = Parser::new(
             ParserConfig::new(concat!("qemu-rdp ", env!("CARGO_PKG_VERSION")))
@@ -37,8 +36,9 @@ impl SessionTask {
         Ok(Self {
             stream,
             parser,
-            bridge: proto::Bridge::new(announce),
-            io: RdpeusbDeviceIo::new(rdp_handle, rx),
+            bridge: proto::Bridge::new(info.announce),
+            io: RdpeusbDeviceIo::new(info.usb_handle, rx),
+            _end_tx: end_tx,
         })
     }
 
