@@ -9,6 +9,7 @@ use tokio::sync::{
 
 mod bridge;
 mod data_inflight;
+mod device;
 mod session_task;
 
 pub struct QemuUsbFactory {
