@@ -2,17 +2,24 @@ use std::os::unix::net::UnixStream;
 
 use anyhow::Context as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use usbredir_proto::{Cap, Event, Host, Parser, ParserConfig};
+use usbredir_proto::{Cap, Event, Host, Packet, Parser, ParserConfig};
 
-use super::{proto, rdpeusb_io::RdpeusbDeviceIo, RdpUsbRedirDevice};
+use super::{bridge::Bridge, RdpUsbRedirDevice, RedirEvent};
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Transport half of one usbredir session.
+///
+/// It frames the QEMU chardev, drives the sans-I/O parser, and pumps the three
+/// event sources of a live session. Everything it learns is handed to
+/// [`Bridge`]; it holds no USB or usbredir state of its own.
 pub(super) struct SessionTask {
     stream: tokio::net::UnixStream,
     parser: Parser<Host>,
-    bridge: proto::Bridge,
-    io: RdpeusbDeviceIo,
+    bridge: Bridge,
+    redir_ev_rx: tokio::sync::mpsc::UnboundedReceiver<RedirEvent>,
+    /// Reused response buffer: bridge handlers append, the transport drains.
+    responses: Vec<Packet>,
     /// Dropped when the session ends, waking the device supervisor to release
     /// the chardev slot.
     _end_tx: tokio::sync::oneshot::Sender<()>,
@@ -36,8 +43,9 @@ impl SessionTask {
         Ok(Self {
             stream,
             parser,
-            bridge: proto::Bridge::new(info.announce),
-            io: RdpeusbDeviceIo::new(info.usb_handle, rx),
+            bridge: Bridge::new(info),
+            redir_ev_rx: rx,
+            responses: Vec::new(),
             _end_tx: end_tx,
         })
     }
@@ -49,6 +57,9 @@ impl SessionTask {
 
         let mut buffer = vec![0; READ_BUFFER_SIZE];
         loop {
+            // Every branch is cancel-safe, which `select!` requires: `read`
+            // and `recv` by contract, and `next_completion` because a request
+            // only leaves the in-flight set once its future has yielded.
             tokio::select! {
                 read = self.stream.read(&mut buffer) => {
                     let read = read.context("read QEMU usbredir chardev")?;
@@ -61,26 +72,38 @@ impl SessionTask {
                     self.parser
                         .feed(&buffer[..read])
                         .context("parse QEMU usbredir data")?;
-                    self.handle_parser_events().await?;
+                    self.dispatch_parsed_packets().await?;
                 }
-                event = self.io.recv() => {
+                completed = self.bridge.next_completion() => {
+                    self.bridge
+                        .handle_completion(completed?, &mut self.responses)
+                        .await?;
+                }
+                event = self.redir_ev_rx.recv() => {
                     let Some(event) = event else {
                         tracing::debug!("RDPEUSB device event channel closed");
                         return Ok(());
                     };
 
-                    let packets = self
-                        .bridge
-                        .handle_rdp_event(event, &mut self.io)
+                    // Closure is a transport fact, not a usbredir one: the
+                    // requests still in flight can no longer be answered, and
+                    // dropping `_end_tx` lets the supervisor release the
+                    // chardev. The bridge never sees this event.
+                    let text = match event {
+                        RedirEvent::Close => {
+                            tracing::debug!("RDPEUSB device channel closed");
+                            return Ok(());
+                        }
+                        RedirEvent::DeviceText(text) => text,
+                    };
+
+                    self.bridge
+                        .handle_device_text(text, &mut self.responses)
                         .await?;
-                    for packet in packets {
-                        self.parser
-                            .send(&packet)
-                            .context("encode usbredir response")?;
-                    }
                 }
             };
 
+            self.encode_responses()?;
             let written = self.flush_output().await?;
             if written != 0 {
                 tracing::debug!(written, "sent queued usbredir packets to QEMU");
@@ -88,27 +111,28 @@ impl SessionTask {
         }
     }
 
-    async fn handle_parser_events(&mut self) -> anyhow::Result<()> {
+    async fn dispatch_parsed_packets(&mut self) -> anyhow::Result<()> {
         while let Some(event) = self.parser.poll() {
             match event {
                 Event::Packet(packet) => {
-                    let packets = self
-                        .bridge
-                        .handle_usbredir_packet(*packet, &mut self.io)
+                    self.bridge
+                        .handle_usbredir_packet(*packet, &mut self.responses)
                         .await?;
-                    for packet in packets {
-                        tracing::debug!(packet = ?packet, "send usbredir packet to QEMU");
-                        self.parser
-                            .send(&packet)
-                            .context("encode usbredir response")?;
-                    }
-
-                    // Complete any response barrier before dispatching another
-                    // packet already queued by the sans-I/O parser.
-                    self.flush_output().await?;
                 }
                 Event::Error(error) => return Err(error).context("decode usbredir packet"),
             }
+        }
+
+        Ok(())
+    }
+
+    /// Moves the responses a handler appended into the parser's output queue.
+    fn encode_responses(&mut self) -> anyhow::Result<()> {
+        for packet in self.responses.drain(..) {
+            tracing::debug!(packet = ?packet, "send usbredir packet to QEMU");
+            self.parser
+                .send(&packet)
+                .context("encode usbredir response")?;
         }
 
         Ok(())

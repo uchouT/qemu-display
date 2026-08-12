@@ -7,8 +7,8 @@ use tokio::sync::{
     oneshot,
 };
 
-mod proto;
-mod rdpeusb_io;
+mod bridge;
+mod data_inflight;
 mod session_task;
 
 pub struct QemuUsbFactory {
