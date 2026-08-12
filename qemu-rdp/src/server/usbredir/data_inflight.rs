@@ -1,4 +1,4 @@
-//! usbredir data packets awaiting their RDPEUSB completion.
+//! RDPEUSB requests awaiting their completion.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -9,20 +9,20 @@ use anyhow::Context as _;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use ironrdp_server::{CompletionFut, PendingHandle, PendingRequest, UsbRequestCompletion};
 
-/// Asynchronous usbredir data packets that still owe QEMU a response.
+use super::transfer::ResponseContext;
+
+/// RDPEUSB requests that have been submitted and have not ended yet.
 ///
-/// usbredir matches responses to requests by ID: every data packet the guest
-/// submits must be answered exactly once, or its URB never completes. An entry
-/// in `pending_ctx` records that outstanding debt, so the two collections stay
-/// in one-to-one correspondence:
+/// The collection tracks request lifetime; what a request is *for* rides with
+/// it as a [`Purpose`] and is never interpreted here. Only the per-purpose
+/// index needed to reach a request while it is unfinished lives alongside the
+/// futures, and [`DataInFlight::completed`] is the only place that removes from
+/// one.
 ///
-/// - a submission inserts into both,
-/// - a cancellation touches neither,
-/// - [`DataInFlight::completed`] is the only place that removes from either.
-///
-/// Request state is split by the phase it applies to: `pending_ctx` holds what
-/// is only usable while the request is unfinished, and [`ResponseContext`]
-/// travels with the future because it is inert until the completion arrives.
+/// `pending_ctx` is such an index: usbredir matches responses to requests by
+/// ID, so a data packet's entry is what a `CancelDataPacket` naming that ID
+/// looks up. Submission inserts, cancellation touches nothing, completion
+/// removes.
 ///
 /// Dropping the collection abandons every outstanding request: each wrapped
 /// [`CompletionFut`] requests cancellation while the device channel is open.
@@ -31,16 +31,16 @@ pub(super) struct DataInFlight {
     pending_ctx: HashMap<u64, PendingContext>,
 }
 
-/// Carries a request's response context alongside its completion future.
+/// Carries a request's purpose alongside its completion future.
 ///
-/// [`CompletionFut`] does not identify its own request, and the context has to
+/// [`CompletionFut`] does not identify its own request, and the purpose has to
 /// stay available on the failure path too: a request that ends without a
-/// completion still owes QEMU a response. Riding with the future also makes it
-/// impossible to pair a completion with another request's context.
+/// completion may still owe QEMU a response. Riding with the future also makes
+/// it impossible to pair a completion with another request's purpose.
 struct DataArrivedFut {
     inner: CompletionFut,
     /// Taken when the request ends, so the future yields at most once.
-    ctx: Option<ResponseContext>,
+    purpose: Option<Purpose>,
 }
 
 /// Request state that is only usable while the request is unfinished.
@@ -50,31 +50,36 @@ struct PendingContext {
     handle: PendingHandle,
 }
 
-/// usbredir state that an RDPEUSB completion does not carry.
-pub(super) struct ResponseContext {
-    pub(super) usbredir_id: u64,
+/// Why a request was submitted, and therefore how its completion is handled.
+///
+/// Each payload belongs to the module that gives it meaning; this enum only
+/// names the kinds, and reads no more of a payload than the index for that kind
+/// needs.
+pub(super) enum Purpose {
+    /// A usbredir data packet whose ID still owes QEMU a response.
+    Data(ResponseContext),
 }
 
-/// handler can use this data to dispatch their handle logic.
-pub(super) struct DataCompleted {
-    pub(super) ctx: ResponseContext,
+/// A request that ended, with everything needed to dispatch it.
+pub(super) struct Completed {
+    pub(super) purpose: Purpose,
     pub(super) result: anyhow::Result<UsbRequestCompletion>,
 }
 
 impl Future for DataArrivedFut {
-    type Output = (ResponseContext, anyhow::Result<UsbRequestCompletion>);
+    type Output = (Purpose, anyhow::Result<UsbRequestCompletion>);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // `CompletionFut` is `Unpin`, so the inner future needs no projection.
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll(cx).map(|result| {
             // `FuturesUnordered` drops a future as soon as it is ready, and
-            // nothing else polls one, so the context is always still here.
-            let ctx = this
-                .ctx
+            // nothing else polls one, so the purpose is always still here.
+            let purpose = this
+                .purpose
                 .take()
-                .expect("usbredir data future polled after completion");
-            (ctx, result)
+                .expect("usbredir request future polled after completion");
+            (purpose, result)
         })
     }
 }
@@ -87,7 +92,34 @@ impl DataInFlight {
         }
     }
 
-    pub(super) fn push_bulk(&mut self, pending: PendingRequest /* other args */) {}
+    /// Tracks a submitted request until it ends.
+    ///
+    /// The match selects the index a purpose is reachable through; it never
+    /// decides what the request does. Indexing runs before the future is
+    /// stored, so a rejected request leaves nothing behind: a reused packet ID
+    /// is a peer protocol violation, and overwriting the entry would silently
+    /// drop the response the first one is owed.
+    pub(super) fn push(&mut self, pending: PendingRequest, purpose: Purpose) -> anyhow::Result<()> {
+        match &purpose {
+            Purpose::Data(ctx) => {
+                let usbredir_id = ctx.usbredir_id;
+                anyhow::ensure!(
+                    !self.pending_ctx.contains_key(&usbredir_id),
+                    "usbredir data packet {usbredir_id} is already in flight"
+                );
+
+                let handle = pending.pending_handle();
+                self.pending_ctx
+                    .insert(usbredir_id, PendingContext { handle });
+            }
+        }
+
+        self.futures.push(DataArrivedFut {
+            inner: pending.wait(),
+            purpose: Some(purpose),
+        });
+        Ok(())
+    }
 
     /// Requests cancellation of a pending usbredir data packet.
     ///
@@ -108,11 +140,11 @@ impl DataInFlight {
     }
 
     /// Waits for the next request to end and releases its pending state.
-    pub(super) async fn completed(&mut self) -> anyhow::Result<DataCompleted> {
+    pub(super) async fn completed(&mut self) -> anyhow::Result<Completed> {
         loop {
             let arrived = self.futures.next().await;
             match arrived {
-                Some((ctx, result)) => return self.release(ctx, result),
+                Some((purpose, result)) => return self.release(purpose, result),
                 // An empty `FuturesUnordered` resolves immediately. Hold the
                 // branch instead of spinning the session loop.
                 None => std::future::pending::<()>().await,
@@ -122,19 +154,25 @@ impl DataInFlight {
 
     /// Cancel-safety: [`FuturesUnordered`] only removes a future once it
     /// yields, so this must stay synchronous. An await between the yield and
-    /// the response would let [`DataInFlight::poll`] be dropped after the
+    /// the response would let [`DataInFlight::completed`] be dropped after the
     /// completion has left the collection, losing a response QEMU is waiting
     /// for.
     fn release(
         &mut self,
-        ctx: ResponseContext,
+        purpose: Purpose,
         result: anyhow::Result<UsbRequestCompletion>,
-    ) -> anyhow::Result<DataCompleted> {
-        let usbredir_id = ctx.usbredir_id;
-        self.pending_ctx.remove(&usbredir_id).with_context(|| {
-            format!("usbredir data packet {usbredir_id} completed without a pending context")
-        })?;
+    ) -> anyhow::Result<Completed> {
+        match &purpose {
+            Purpose::Data(ctx) => {
+                let usbredir_id = ctx.usbredir_id;
+                self.pending_ctx.remove(&usbredir_id).with_context(|| {
+                    format!(
+                        "usbredir data packet {usbredir_id} completed without a pending context"
+                    )
+                })?;
+            }
+        }
 
-        Ok(DataCompleted { ctx, result })
+        Ok(Completed { purpose, result })
     }
 }

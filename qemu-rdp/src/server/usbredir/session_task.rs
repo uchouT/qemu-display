@@ -8,6 +8,15 @@ use super::{bridge::Bridge, RdpUsbRedirDevice, RedirEvent};
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
+/// What one pass of the session loop decided about the session's lifetime.
+enum Flow {
+    Continue,
+    /// QEMU closed the chardev, so nothing more can be written to it.
+    PeerClosed,
+    /// The redirected device is gone, which QEMU still has to be told.
+    DeviceGone,
+}
+
 /// Transport half of one usbredir session.
 ///
 /// It frames the QEMU chardev, drives the sans-I/O parser, and pumps the three
@@ -60,53 +69,69 @@ impl SessionTask {
             // Every branch is cancel-safe, which `select!` requires: `read`
             // and `recv` by contract, and `next_completion` because a request
             // only leaves the in-flight set once its future has yielded.
-            tokio::select! {
+            let flow = tokio::select! {
                 read = self.stream.read(&mut buffer) => {
                     let read = read.context("read QEMU usbredir chardev")?;
                     if read == 0 {
                         tracing::debug!("QEMU usbredir chardev closed");
-                        return Ok(());
+                        Flow::PeerClosed
+                    } else {
+                        tracing::trace!(read, "received bytes from QEMU usbredir chardev");
+                        self.parser
+                            .feed(&buffer[..read])
+                            .context("parse QEMU usbredir data")?;
+                        self.dispatch_parsed_packets().await?;
+                        Flow::Continue
                     }
-
-                    tracing::trace!(read, "received bytes from QEMU usbredir chardev");
-                    self.parser
-                        .feed(&buffer[..read])
-                        .context("parse QEMU usbredir data")?;
-                    self.dispatch_parsed_packets().await?;
                 }
                 completed = self.bridge.next_completion() => {
                     self.bridge
                         .handle_completion(completed?, &mut self.responses)
                         .await?;
+                    Flow::Continue
                 }
                 event = self.redir_ev_rx.recv() => {
-                    let Some(event) = event else {
-                        tracing::debug!("RDPEUSB device event channel closed");
-                        return Ok(());
-                    };
-
-                    // Closure is a transport fact, not a usbredir one: the
-                    // requests still in flight can no longer be answered, and
-                    // dropping `_end_tx` lets the supervisor release the
-                    // chardev. The bridge never sees this event.
-                    let text = match event {
-                        RedirEvent::Close => {
-                            tracing::debug!("RDPEUSB device channel closed");
-                            return Ok(());
+                    // Losing the device is a transport fact, not a usbredir
+                    // one: the requests still in flight can no longer be
+                    // answered, and dropping `_end_tx` lets the supervisor
+                    // release the chardev. What the bridge decides is only
+                    // what QEMU is told about it.
+                    match event {
+                        None => {
+                            tracing::debug!("RDPEUSB device event channel closed");
+                            Flow::DeviceGone
                         }
-                        RedirEvent::DeviceText(text) => text,
-                    };
-
-                    self.bridge
-                        .handle_device_text(text, &mut self.responses)
-                        .await?;
+                        Some(RedirEvent::Close) => {
+                            tracing::debug!("RDPEUSB device channel closed");
+                            Flow::DeviceGone
+                        }
+                        Some(RedirEvent::DeviceText(text)) => {
+                            self.bridge
+                                .handle_device_text(text, &mut self.responses)
+                                .await?;
+                            Flow::Continue
+                        }
+                    }
                 }
             };
+
+            // Nothing can be written to a chardev that is already gone, and
+            // the queued responses have nowhere left to go.
+            if matches!(flow, Flow::PeerClosed) {
+                return Ok(());
+            }
+            if matches!(flow, Flow::DeviceGone) {
+                self.bridge.handle_device_gone(&mut self.responses);
+            }
 
             self.encode_responses()?;
             let written = self.flush_output().await?;
             if written != 0 {
                 tracing::debug!(written, "sent queued usbredir packets to QEMU");
+            }
+
+            if matches!(flow, Flow::DeviceGone) {
+                return Ok(());
             }
         }
     }

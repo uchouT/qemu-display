@@ -11,6 +11,7 @@ mod bridge;
 mod data_inflight;
 mod device;
 mod session_task;
+mod transfer;
 
 pub struct QemuUsbFactory {
     usbredir: UsbRedir<RdpUsb>,

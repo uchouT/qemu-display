@@ -5,13 +5,12 @@ use ironrdp_rdpeusb::pdu::sink::DeviceSpeed;
 use ironrdp_server::{
     DeviceAnnounce, DeviceText, RdpUsbDeviceAnnounceInfo, UsbDeviceHandle, UsbRequestCompletion,
 };
-use ironrdp_usb::{
-    descriptor::ConfigurationDescriptorSet, transfer::UsbError, value::InterfaceSelection,
-};
+use ironrdp_usb::{descriptor::ConfigurationDescriptorSet, transfer::UsbError, InterfaceSelection};
 use usbredir_proto::{Caps, Packet, RequestKind, RequestPacket, Speed, Status};
 
-use super::data_inflight::{DataCompleted, DataInFlight};
+use super::data_inflight::{Completed, DataInFlight, Purpose};
 use super::device::ActiveDevice;
+use super::transfer;
 
 /// Stateful boundary between usbredir packets and IronRDP device I/O.
 ///
@@ -59,7 +58,7 @@ impl Bridge {
     /// Cancel-safe, so the session task can select on it: a request only
     /// leaves [`DataInFlight`] once its future has yielded, and nothing is
     /// awaited after that point.
-    pub(super) async fn next_completion(&mut self) -> anyhow::Result<DataCompleted> {
+    pub(super) async fn next_completion(&mut self) -> anyhow::Result<Completed> {
         self.inflight.completed().await
     }
 
@@ -73,8 +72,17 @@ impl Bridge {
             Packet::Hello { version, caps } => self.handle_peer_hello(&version, caps, out).await,
             Packet::Request(request) => self.handle_request(request, out).await,
             Packet::Data(packet) => {
-                let _ = (packet, out);
-                todo!("usbredir data packet dispatch")
+                let Self {
+                    usb,
+                    inflight,
+                    state,
+                    ..
+                } = self;
+                let State::Active(device) = state else {
+                    anyhow::bail!("received a usbredir data packet before peer Hello");
+                };
+
+                transfer::handle_data(usb, device, inflight, packet, out).await
             }
             packet => {
                 tracing::warn!(?packet, "Ignored unexpected usbredir packet from QEMU");
@@ -83,24 +91,60 @@ impl Bridge {
         }
     }
 
-    /// Turns a finished USB request into the response its packet ID owes QEMU.
+    /// Dispatches a finished USB request by what it was submitted for.
     pub(super) async fn handle_completion(
         &mut self,
-        completed: DataCompleted,
+        completed: Completed,
         out: &mut Vec<Packet>,
     ) -> anyhow::Result<()> {
-        let _ = (completed, out);
-        todo!("usbredir data completion translation")
+        let State::Active(device) = &mut self.state else {
+            anyhow::bail!("received a usb completion before peer Hello");
+        };
+
+        let Completed { purpose, result } = completed;
+        match purpose {
+            Purpose::Data(ctx) => transfer::complete(device, ctx, result, out),
+        }
+    }
+
+    /// Tells QEMU that the redirected device is gone.
+    ///
+    /// The requests still in flight are not answered: the RDPEUSB channel that
+    /// would carry their completions is exactly what went away. usbredir
+    /// expects that, and a guest discards its pending packets when the device
+    /// disconnects.
+    ///
+    /// Nothing is announced before the device was: QEMU cannot be told a device
+    /// left if it was never told one arrived.
+    ///
+    /// This is the last thing a session does, so the bridge state is left as it
+    /// is rather than given a phase no other packet can observe.
+    pub(super) fn handle_device_gone(&self, out: &mut Vec<Packet>) {
+        let State::Active(_) = &self.state else {
+            tracing::debug!("RDPEUSB device ended before it was announced to QEMU");
+            return;
+        };
+
+        out.push(Packet::DeviceDisconnect);
+        tracing::debug!("Announcing usbredir device disconnect to QEMU");
     }
 
     /// Handles device text reported by the RDP client.
+    ///
+    /// usbredir has nowhere to put it: the device description QEMU shows comes
+    /// from the descriptors. Nothing queries device text yet, so an arriving
+    /// one is unsolicited.
     pub(super) async fn handle_device_text(
         &mut self,
         text: DeviceText,
-        out: &mut Vec<Packet>,
+        _out: &mut Vec<Packet>,
     ) -> anyhow::Result<()> {
-        let _ = (text, out);
-        todo!("usbredir device text translation")
+        tracing::debug!(
+            hresult = text.hresult,
+            description_len = text.description.len(),
+            "Ignored unsolicited RDPEUSB device text"
+        );
+        Ok(())
     }
 
     /// Answers the peer Hello by making the redirected device visible to QEMU.
@@ -115,7 +159,7 @@ impl Bridge {
             "received a second usbredir Hello"
         );
 
-        tracing::debug!(version, ?caps, "received QEMU usbredir Hello");
+        tracing::debug!(version, peer_caps = %caps, "Received QEMU usbredir Hello");
         tracing::debug!(
             device_instance_id = %self.announce.device_instance_id,
             "preparing RDPEUSB device for usbredir announcement"
@@ -219,22 +263,6 @@ impl Bridge {
             }
             RequestKind::FreeBulkStreams { endpoints } => {
                 out.push(Packet::bulk_streams_status(id, endpoints, 0, Status::Inval));
-            }
-            RequestKind::StartBulkReceiving {
-                stream_id,
-                endpoint,
-                ..
-            }
-            | RequestKind::StopBulkReceiving {
-                stream_id,
-                endpoint,
-            } => {
-                out.push(Packet::bulk_receiving_status(
-                    id,
-                    stream_id,
-                    endpoint,
-                    Status::Inval,
-                ));
             }
             kind => tracing::warn!(id, ?kind, "Ignored unexpected usbredir request from QEMU"),
         }
@@ -437,7 +465,7 @@ fn push_metadata(device: &ActiveDevice, out: &mut Vec<Packet>) {
     out.push(Packet::interface_info(interface_info));
 }
 
-fn usbredir_status(error: UsbError) -> Status {
+pub(super) fn usbredir_status(error: UsbError) -> Status {
     match error {
         UsbError::Cancelled => Status::Cancelled,
         UsbError::Stall => Status::Stall,

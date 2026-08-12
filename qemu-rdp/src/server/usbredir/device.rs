@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, ensure, Context as _};
-use ironrdp_rdpeusb::usb as rdpeusb;
 use ironrdp_server::{UsbDeviceHandle, UsbRequestCompletion};
 use ironrdp_usb::{
     control::{GetDescriptorRequest, Recipient},
@@ -11,7 +10,7 @@ use ironrdp_usb::{
         descriptor_type, ConfigurationDescriptorSet, DeviceDescriptor, EndpointDescriptor,
         InterfaceDescriptor,
     },
-    value::{TransferType as UsbTransferType, UsbSpeed},
+    TransferType as UsbTransferType, UsbSpeed,
 };
 use usbredir_proto::{
     DeviceConnectInfo, EpInfoData, InterfaceInfoData, Speed, TransferType as UsbredirTransferType,
@@ -75,7 +74,7 @@ impl ActiveDevice {
             device_protocol: class.protocol,
             vendor_id: descriptor.vendor_id(),
             product_id: descriptor.product_id(),
-            device_version_bcd: descriptor.device_release(),
+            device_version_bcd: descriptor.device_release().raw(),
         };
         let (interface_info, ep_info) = usbredir_config_info(descriptor, None, &[], speed)?;
 
@@ -136,6 +135,34 @@ impl ActiveDevice {
         (self.announced.configuration != 0)
             .then(|| self.configuration_descriptor(self.announced.configuration))
             .flatten()
+    }
+
+    /// The device descriptor exactly as the device returned it.
+    pub(super) fn device_descriptor_bytes(&self) -> &[u8] {
+        &self.device_descriptor
+    }
+
+    /// Cached descriptor bytes of a configuration, by descriptor index.
+    pub(super) fn configuration_descriptor_by_index(&self, index: u8) -> Option<&[u8]> {
+        self.configurations.get(&index).map(Vec::as_slice)
+    }
+
+    /// Caches a configuration descriptor the guest read for itself.
+    ///
+    /// Rejecting a malformed descriptor here keeps the cache trustworthy for
+    /// the selection path, which builds RDPEUSB requests from it.
+    pub(super) fn insert_configuration_descriptor(
+        &mut self,
+        index: u8,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let set = ConfigurationDescriptorSet::parse(bytes)
+            .context("parse usb configuration descriptor")?;
+        set.validate()
+            .context("invalid usb configuration descriptor")?;
+
+        self.configurations.insert(index, bytes.to_vec());
+        Ok(())
     }
 
     /// Reads configuration descriptors until `configuration` is cached.
@@ -346,17 +373,16 @@ fn usbredir_config_info(
             ep_info.ep_type[slot] = usbredir_transfer_type(endpoint.transfer_type());
             ep_info.interval[slot] = usbredir_interval(endpoint, speed);
             ep_info.interface[slot] = number;
-            ep_info.max_packet_size[slot] = rdpeusb::maximum_packet_size(
-                endpoint.max_packet_size(),
-                endpoint.transfer_type(),
-                usb_speed,
-            )
-            .map_err(|raw| {
-                anyhow::anyhow!(
-                    "usb endpoint {:#04x} has invalid wMaxPacketSize {raw:#06x}",
-                    address.raw()
-                )
-            })?;
+            let max_packet_size = endpoint.max_packet_size();
+            ep_info.max_packet_size[slot] = max_packet_size
+                .usb2_max_payload(usb_speed, endpoint.transfer_type())
+                .with_context(|| {
+                    format!(
+                        "usb endpoint {:#04x} has invalid wMaxPacketSize {:#06x}",
+                        address.raw(),
+                        max_packet_size.raw()
+                    )
+                })?;
             ep_info.max_streams[slot] = endpoint_max_streams(interface, endpoint);
         }
     }
