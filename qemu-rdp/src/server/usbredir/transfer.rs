@@ -5,7 +5,8 @@ use bytes::Bytes;
 use ironrdp_server::{UsbDeviceHandle, UsbRequestCompletion};
 use ironrdp_usb::{
     control::{
-        standard_request, Recipient, RequestKind as ControlRequestKind, RequestType, SetupPacket,
+        standard_feature::ENDPOINT_HALT, standard_request, Recipient,
+        RequestKind as ControlRequestKind, RequestType, SetupPacket,
     },
     descriptor::{descriptor_type, ConfigurationDescriptorSet},
     endpoint::EndpointAddress,
@@ -49,9 +50,6 @@ pub(super) enum Reply {
         endpoint: Endpoint,
     },
 }
-
-/// `ENDPOINT_HALT`, the only standard endpoint feature selector.
-const ENDPOINT_HALT: u16 = 0;
 
 /// A standard descriptor qemu-rdp keeps a copy of.
 enum CacheableDescriptor {
