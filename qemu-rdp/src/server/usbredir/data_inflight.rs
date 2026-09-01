@@ -79,7 +79,7 @@ impl Future for DataArrivedFut {
                 .purpose
                 .take()
                 .expect("usbredir request future polled after completion");
-            (purpose, result)
+            (purpose, result.context("rdp server pending error"))
         })
     }
 }

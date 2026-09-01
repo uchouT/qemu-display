@@ -27,7 +27,7 @@ console-subscriber = "0.5"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "cargo"] }
 async-trait = "0.1"
-ironrdp = { path = "../../IronRDP/crates/ironrdp", features = [
+ironrdp = { git = "https://github.com/uchouT/IronRDP.git", branch = "usb3", features = [
     "connector",
     "server",
     "svc",
@@ -36,9 +36,9 @@ ironrdp = { path = "../../IronRDP/crates/ironrdp", features = [
     "rdpsnd",
     "qoiz",
 ] }
-ironrdp-server = { path = "../../IronRDP/crates/ironrdp-server", features = ["helper", "usb"] }
-ironrdp-rdpeusb = { path = "../../IronRDP/crates/ironrdp-rdpeusb" }
-ironrdp-usb = { path = "../../IronRDP/crates/ironrdp-usb" }
+ironrdp-server = { git = "https://github.com/uchouT/IronRDP.git", branch = "usb3", features = ["helper", "usb"] }
+ironrdp-rdpeusb = { git = "https://github.com/uchouT/IronRDP.git", branch = "usb3" }
+ironrdp-usb = { git = "https://github.com/uchouT/IronRDP.git", branch = "usb3" }
 usbredir-proto = { git = "https://github.com/elmarco/usbredir-proto.git" }
 
 futures-util = "0.3"

@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
+use ironrdp_server::{ServerError, ServerErrorExt, ServerResult};
 use qemu_display::{
     Console, ConsoleListenerHandler, ConsoleListenerMapHandler, Cursor, Display, MouseSet, Scanout,
     ScanoutMap, ScanoutMmap, Update, UpdateMap,
@@ -64,7 +65,7 @@ impl DisplayHandler {
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         Ok(self.receiver.recv().await)
     }
 }
@@ -77,8 +78,12 @@ impl RdpServerDisplay for DisplayHandler {
         DesktopSize { height, width }
     }
 
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        Ok(Box::new(self.listen().await?))
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        Ok(Box::new(
+            self.listen()
+                .await
+                .map_err(|_| ServerError::reason("listen", "test"))?,
+        ))
     }
 
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {

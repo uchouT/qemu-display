@@ -1,6 +1,8 @@
 use qemu_display::{Console, Display, MouseButton};
 
-use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{
+    KeyboardEvent, MouseButton as RdpMouseButton, MouseEvent, RdpServerInputHandler,
+};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task,
@@ -54,10 +56,27 @@ async fn input_receive_task(mut rx: Receiver<InputEvent>, console: Console) {
                     tracing::trace!(?x, ?y);
                     console.mouse.set_abs_position(x.into(), y.into()).await
                 }
-                MouseEvent::RightPressed => console.mouse.press(MouseButton::Right).await,
-                MouseEvent::RightReleased => console.mouse.release(MouseButton::Right).await,
-                MouseEvent::LeftPressed => console.mouse.press(MouseButton::Left).await,
-                MouseEvent::LeftReleased => console.mouse.release(MouseButton::Left).await,
+                MouseEvent::Button {
+                    button, pressed, ..
+                } => {
+                    let button = match button {
+                        RdpMouseButton::Left => Some(MouseButton::Left),
+                        RdpMouseButton::Right => Some(MouseButton::Right),
+                        RdpMouseButton::Middle => Some(MouseButton::Middle),
+                        RdpMouseButton::X1 => Some(MouseButton::Side),
+                        RdpMouseButton::X2 => Some(MouseButton::Extra),
+                        // `MouseButton` is non-exhaustive upstream.
+                        other => {
+                            eprintln!("unhandled mouse button: {other:?}");
+                            None
+                        }
+                    };
+                    match button {
+                        Some(button) if pressed => console.mouse.press(button).await,
+                        Some(button) => console.mouse.release(button).await,
+                        None => Ok(()),
+                    }
+                }
                 MouseEvent::VerticalScroll { value } => {
                     let motion = if value > 0 {
                         MouseButton::WheelUp
