@@ -1,12 +1,11 @@
 //! usbredir session semantics on top of the IronRDP USB device facade.
 
 use anyhow::{ensure, Context as _};
-use ironrdp_rdpeusb::pdu::sink::DeviceSpeed;
 use ironrdp_server::{
-    DeviceAnnounce, DeviceText, RdpUsbDeviceAnnounceInfo, UsbDeviceHandle, UsbRequestCompletion,
+    DeviceText, RdpUsbDeviceAnnounceInfo, UsbDeviceAnnounce, UsbDeviceHandle, UsbRequestCompletion,
 };
 use ironrdp_usb::{descriptor::ConfigurationDescriptorSet, transfer::UsbError, InterfaceSelection};
-use usbredir_proto::{Caps, Packet, RequestKind, RequestPacket, Speed, Status};
+use usbredir_proto::{Caps, Packet, RequestKind, RequestPacket, Status};
 
 use super::data_inflight::{Completed, DataInFlight, Purpose};
 use super::device::ActiveDevice;
@@ -24,7 +23,7 @@ pub(super) struct Bridge {
     usb: UsbDeviceHandle,
     inflight: DataInFlight,
     /// The device as RDPEUSB announced it, before any usbredir negotiation.
-    announce: DeviceAnnounce,
+    announce: UsbDeviceAnnounce,
     state: State,
 }
 
@@ -165,7 +164,7 @@ impl Bridge {
             "preparing RDPEUSB device for usbredir announcement"
         );
 
-        let device = ActiveDevice::prepare(&self.usb, self.device_speed())
+        let device = ActiveDevice::prepare(&self.usb, self.announce.speed)
             .await
             .context("prepare rdpeusb device for usbredir")?;
 
@@ -268,19 +267,6 @@ impl Bridge {
         }
 
         Ok(())
-    }
-
-    /// Ref: MS-RDPEUSB `UsbDeviceCaps.DeviceSpeed` and usbredir v0.7
-    /// `usb_redir_device_connect`.
-    ///
-    /// RDPEUSB only distinguishes full from high speed, and `bcdUSB` alone does
-    /// not prove SuperSpeed, so no other speed can be reported honestly.
-    fn device_speed(&self) -> Speed {
-        match self.announce.usb_device_caps.device_speed {
-            DeviceSpeed::HIGH_SPEED => Speed::High,
-            DeviceSpeed::FULL_SPEED => Speed::Full,
-            _ => Speed::Unknown,
-        }
     }
 }
 

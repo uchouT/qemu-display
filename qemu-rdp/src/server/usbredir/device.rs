@@ -24,7 +24,7 @@ pub(super) struct ActiveDevice {
     /// Kept verbatim: usbredir forwards descriptor bytes unchanged, so a quirky
     /// descriptor must survive the round trip byte for byte.
     device_descriptor: Vec<u8>,
-    speed: Speed,
+    speed: UsbSpeed,
     device_connect: DeviceConnectInfo,
     /// Complete configuration descriptor sets, keyed by descriptor index.
     ///
@@ -53,7 +53,7 @@ impl ActiveDevice {
     /// The guest-visible device starts unconfigured whatever the RDP client
     /// happened to leave it in: QEMU only observes a configuration once its own
     /// SetConfiguration has succeeded.
-    pub(super) async fn prepare(usb: &UsbDeviceHandle, announced_speed: Speed) -> anyhow::Result<Self> {
+    pub(super) async fn prepare(usb: &UsbDeviceHandle, announced_speed: UsbSpeed) -> anyhow::Result<Self> {
         let device_descriptor =
             get_descriptor(usb, descriptor_type::DEVICE, 0, DEVICE_DESCRIPTOR_MIN_LENGTH)
                 .await
@@ -71,14 +71,14 @@ impl ActiveDevice {
         // the announcement, and QEMU needs it: its endpoint-zero fixup for a
         // SuperSpeed device on a slower controller keys off the reported speed.
         let speed = if descriptor.max_packet_size_0_raw() == DeviceDescriptor::SUPERSPEED_MAX_PACKET_SIZE_0 {
-            Speed::Super
+            UsbSpeed::Super
         } else {
             announced_speed
         };
 
         let class = descriptor.class();
         let device_connect = DeviceConnectInfo {
-            speed,
+            speed: usbredir_speed(speed),
             device_class: class.class,
             device_subclass: class.subclass,
             device_protocol: class.protocol,
@@ -315,7 +315,7 @@ fn usbredir_config_info(
     device: DeviceDescriptor<'_>,
     config: Option<ConfigurationDescriptorSet<'_>>,
     active_interfaces: &[(u8, u8)],
-    speed: Speed,
+    speed: UsbSpeed,
 ) -> anyhow::Result<(InterfaceInfoData, EpInfoData)> {
     ensure!(
         active_interfaces.len() <= EP_INFO_SLOTS,
@@ -339,7 +339,6 @@ fn usbredir_config_info(
 
     // The default control pipe occupies both direction slots of endpoint zero
     // and exists whether or not the device is configured.
-    let usb_speed = usb_speed(speed)?;
     let max_packet_size_0 = device
         .endpoint_zero_max_packet_size()
         .context("interpret usb bMaxPacketSize0")?;
@@ -383,7 +382,7 @@ fn usbredir_config_info(
             ep_info.interface[slot] = number;
             let max_packet_size = endpoint.max_packet_size();
             ep_info.max_packet_size[slot] = max_packet_size
-                .max_payload(usb_speed, endpoint.transfer_type())
+                .max_payload(speed, endpoint.transfer_type())
                 .with_context(|| {
                     format!(
                         "usb endpoint {:#04x} has invalid wMaxPacketSize {:#06x}",
@@ -418,14 +417,14 @@ fn usbredir_transfer_type(transfer_type: UsbTransferType) -> UsbredirTransferTyp
 
 /// usbredir reports the polling interval in frames or microframes for periodic
 /// endpoints, so the exponential high-speed encoding has to be expanded.
-fn usbredir_interval(endpoint: EndpointDescriptor<'_>, speed: Speed) -> u8 {
+fn usbredir_interval(endpoint: EndpointDescriptor<'_>, speed: UsbSpeed) -> u8 {
     if !matches!(
         endpoint.transfer_type(),
         UsbTransferType::Isochronous | UsbTransferType::Interrupt
     ) {
         return 0;
     }
-    if !matches!(speed, Speed::High | Speed::Super) || endpoint.interval() == 0 {
+    if !(speed == UsbSpeed::High || speed.is_superspeed()) || endpoint.interval() == 0 {
         return endpoint.interval();
     }
 
@@ -463,16 +462,19 @@ fn endpoint_max_streams(
     0
 }
 
-fn usb_speed(speed: Speed) -> anyhow::Result<UsbSpeed> {
+/// Narrows the USB bus speed onto the usbredir encoding, which is only needed
+/// to announce the device.
+///
+/// usbredir v0.7 has no SuperSpeed+ encoding, so a SuperSpeed+ device is
+/// announced as SuperSpeed; a speed this build cannot name is announced as
+/// unknown rather than guessed.
+fn usbredir_speed(speed: UsbSpeed) -> Speed {
     match speed {
-        Speed::Low => Ok(UsbSpeed::Low),
-        Speed::Full => Ok(UsbSpeed::Full),
-        Speed::High => Ok(UsbSpeed::High),
-        Speed::Super => Ok(UsbSpeed::Super),
-        // Endpoint-zero packet size cannot be interpreted without a speed, so
-        // the device cannot be announced at all.
-        Speed::Unknown => bail!("usb device speed is unknown"),
-        speed => bail!("unsupported usb device speed {speed:?}"),
+        UsbSpeed::Low => Speed::Low,
+        UsbSpeed::Full => Speed::Full,
+        UsbSpeed::High => Speed::High,
+        UsbSpeed::Super | UsbSpeed::SuperPlus => Speed::Super,
+        _ => Speed::Unknown,
     }
 }
 
