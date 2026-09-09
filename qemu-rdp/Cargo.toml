@@ -26,7 +26,7 @@ tokio = { version = "1.39", features = ["full"] }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "cargo"] }
 async-trait = "0.1"
-ironrdp = { git = "https://github.com/Devolutions/IronRDP.git", rev = "4755faec", features = [
+ironrdp = { git = "https://github.com/devolutions/IronRDP.git", rev = "da016ce", features = [
     "connector",
     "server",
     "svc",
@@ -35,12 +35,11 @@ ironrdp = { git = "https://github.com/Devolutions/IronRDP.git", rev = "4755faec"
     "rdpsnd",
     "qoiz",
 ] }
-ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "4755faec", features = [
+ironrdp-server = { git = "https://github.com/devolutions/IronRDP.git", rev = "da016ce", features = [
     "helper",
     "usb",
 ] }
-ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP.git", rev = "4755faec" }
-ironrdp-usb = { git = "https://github.com/Devolutions/IronRDP.git", rev = "4755faec" }
+ironrdp-usb = { git = "https://github.com/devolutions/IronRDP.git", rev = "da016ce" }
 usbredir-proto = { git = "https://github.com/elmarco/usbredir-proto.git" }
 
 futures-util = "0.3"
