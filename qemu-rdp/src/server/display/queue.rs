@@ -14,7 +14,8 @@ use std::{
 use tokio::sync::{Mutex, MutexGuard, Notify};
 
 use DisplayUpdate::{
-    Bitmap, CachedPointer, ColorPointer, DefaultPointer, HidePointer, RGBAPointer, Resize,
+    Bitmap, CachedPointer, ColorPointer, DefaultPointer, HidePointer, LargePointer, RGBAPointer,
+    Resize,
 };
 
 mod rect;
@@ -135,12 +136,14 @@ fn push_update(queue: &mut MutexGuard<VecDeque<DisplayUpdate>>, item: DisplayUpd
                 return true;
             }
         }
-        ColorPointer(_) | RGBAPointer(_) | CachedPointer(_) | HidePointer | DefaultPointer => {
+        LargePointer(_) | ColorPointer(_) | RGBAPointer(_) | CachedPointer(_) | HidePointer
+        | DefaultPointer => {
             // If there is already a pointer shape update in the queue, replace it with the new one
             if let Some(idx) = queue.iter().position(|update| {
                 matches!(
                     update,
-                    ColorPointer(_)
+                    LargePointer(_)
+                        | ColorPointer(_)
                         | RGBAPointer(_)
                         | CachedPointer(_)
                         | HidePointer

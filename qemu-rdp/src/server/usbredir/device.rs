@@ -8,18 +8,13 @@ use ironrdp_usb::{
     control::{GetDescriptorRequest, Recipient},
     descriptor::{
         descriptor_type, ConfigurationDescriptorSet, DeviceDescriptor, EndpointDescriptor,
-        InterfaceDescriptor,
+        InterfaceDescriptor, CONFIGURATION_DESCRIPTOR_MIN_LENGTH, DEVICE_DESCRIPTOR_MIN_LENGTH,
     },
     TransferType as UsbTransferType, UsbSpeed,
 };
 use usbredir_proto::{
     DeviceConnectInfo, EpInfoData, InterfaceInfoData, Speed, TransferType as UsbredirTransferType,
 };
-
-/// `bLength` of a standard USB device descriptor.
-const DEVICE_DESCRIPTOR_LENGTH: u16 = 18;
-/// `bLength` of a configuration descriptor header, which declares `wTotalLength`.
-const CONFIGURATION_DESCRIPTOR_HEADER_LENGTH: u16 = 9;
 
 /// Endpoint slots in a usbredir `ep_info` packet: OUT 0-15, then IN 0-15.
 const EP_INFO_SLOTS: usize = 32;
@@ -29,7 +24,7 @@ pub(super) struct ActiveDevice {
     /// Kept verbatim: usbredir forwards descriptor bytes unchanged, so a quirky
     /// descriptor must survive the round trip byte for byte.
     device_descriptor: Vec<u8>,
-    speed: Speed,
+    speed: UsbSpeed,
     device_connect: DeviceConnectInfo,
     /// Complete configuration descriptor sets, keyed by descriptor index.
     ///
@@ -58,17 +53,32 @@ impl ActiveDevice {
     /// The guest-visible device starts unconfigured whatever the RDP client
     /// happened to leave it in: QEMU only observes a configuration once its own
     /// SetConfiguration has succeeded.
-    pub(super) async fn prepare(usb: &UsbDeviceHandle, speed: Speed) -> anyhow::Result<Self> {
+    pub(super) async fn prepare(usb: &UsbDeviceHandle, announced_speed: UsbSpeed) -> anyhow::Result<Self> {
         let device_descriptor =
-            get_descriptor(usb, descriptor_type::DEVICE, 0, DEVICE_DESCRIPTOR_LENGTH)
+            get_descriptor(usb, descriptor_type::DEVICE, 0, DEVICE_DESCRIPTOR_MIN_LENGTH)
                 .await
                 .context("query usb device descriptor")?;
 
         let descriptor =
             DeviceDescriptor::parse(&device_descriptor).context("parse usb device descriptor")?;
+
+        // RDPEUSB announces the speed through USB_DEVICE_CAPABILITIES
+        // ([MS-RDPEUSB] 2.2.11), which distinguishes only full from high, so a
+        // client redirecting a SuperSpeed device cannot report it and settles
+        // for high. The descriptor still carries the truth: USB 3.2 9.6.1 lets
+        // a SuperSpeed device state `bMaxPacketSize0` only as the base-2
+        // exponent 9, a value no slower speed may use. It therefore overrides
+        // the announcement, and QEMU needs it: its endpoint-zero fixup for a
+        // SuperSpeed device on a slower controller keys off the reported speed.
+        let speed = if descriptor.max_packet_size_0_raw() == DeviceDescriptor::SUPERSPEED_MAX_PACKET_SIZE_0 {
+            UsbSpeed::Super
+        } else {
+            announced_speed
+        };
+
         let class = descriptor.class();
         let device_connect = DeviceConnectInfo {
-            speed,
+            speed: usbredir_speed(speed),
             device_class: class.class,
             device_subclass: class.subclass,
             device_protocol: class.protocol,
@@ -190,15 +200,13 @@ impl ActiveDevice {
                 usb,
                 descriptor_type::CONFIGURATION,
                 index,
-                CONFIGURATION_DESCRIPTOR_HEADER_LENGTH,
+                CONFIGURATION_DESCRIPTOR_MIN_LENGTH,
             )
             .await
             .with_context(|| format!("query usb configuration descriptor {index} header"))?;
             let total_length = ConfigurationDescriptorSet::required_length(&header)
                 .context("parse usb configuration descriptor header")?
                 .context("usb configuration descriptor header is incomplete")?;
-            let total_length =
-                u16::try_from(total_length).context("usb configuration descriptor is too large")?;
 
             let bytes = get_descriptor(usb, descriptor_type::CONFIGURATION, index, total_length)
                 .await
@@ -307,7 +315,7 @@ fn usbredir_config_info(
     device: DeviceDescriptor<'_>,
     config: Option<ConfigurationDescriptorSet<'_>>,
     active_interfaces: &[(u8, u8)],
-    speed: Speed,
+    speed: UsbSpeed,
 ) -> anyhow::Result<(InterfaceInfoData, EpInfoData)> {
     ensure!(
         active_interfaces.len() <= EP_INFO_SLOTS,
@@ -331,9 +339,8 @@ fn usbredir_config_info(
 
     // The default control pipe occupies both direction slots of endpoint zero
     // and exists whether or not the device is configured.
-    let usb_speed = usb_speed(speed)?;
     let max_packet_size_0 = device
-        .endpoint_zero_max_packet_size(usb_speed)
+        .endpoint_zero_max_packet_size()
         .context("interpret usb bMaxPacketSize0")?;
     for slot in [0, EP_INFO_IN_SLOT_BASE] {
         ep_info.ep_type[slot] = UsbredirTransferType::Control;
@@ -375,7 +382,7 @@ fn usbredir_config_info(
             ep_info.interface[slot] = number;
             let max_packet_size = endpoint.max_packet_size();
             ep_info.max_packet_size[slot] = max_packet_size
-                .usb2_max_payload(usb_speed, endpoint.transfer_type())
+                .max_payload(speed, endpoint.transfer_type())
                 .with_context(|| {
                     format!(
                         "usb endpoint {:#04x} has invalid wMaxPacketSize {:#06x}",
@@ -410,14 +417,14 @@ fn usbredir_transfer_type(transfer_type: UsbTransferType) -> UsbredirTransferTyp
 
 /// usbredir reports the polling interval in frames or microframes for periodic
 /// endpoints, so the exponential high-speed encoding has to be expanded.
-fn usbredir_interval(endpoint: EndpointDescriptor<'_>, speed: Speed) -> u8 {
+fn usbredir_interval(endpoint: EndpointDescriptor<'_>, speed: UsbSpeed) -> u8 {
     if !matches!(
         endpoint.transfer_type(),
         UsbTransferType::Isochronous | UsbTransferType::Interrupt
     ) {
         return 0;
     }
-    if !matches!(speed, Speed::High | Speed::Super) || endpoint.interval() == 0 {
+    if !(speed == UsbSpeed::High || speed.is_superspeed()) || endpoint.interval() == 0 {
         return endpoint.interval();
     }
 
@@ -455,16 +462,19 @@ fn endpoint_max_streams(
     0
 }
 
-fn usb_speed(speed: Speed) -> anyhow::Result<UsbSpeed> {
+/// Narrows the USB bus speed onto the usbredir encoding, which is only needed
+/// to announce the device.
+///
+/// usbredir v0.7 has no SuperSpeed+ encoding, so a SuperSpeed+ device is
+/// announced as SuperSpeed; a speed this build cannot name is announced as
+/// unknown rather than guessed.
+fn usbredir_speed(speed: UsbSpeed) -> Speed {
     match speed {
-        Speed::Low => Ok(UsbSpeed::Low),
-        Speed::Full => Ok(UsbSpeed::Full),
-        Speed::High => Ok(UsbSpeed::High),
-        Speed::Super => Ok(UsbSpeed::Super),
-        // Endpoint-zero packet size cannot be interpreted without a speed, so
-        // the device cannot be announced at all.
-        Speed::Unknown => bail!("usb device speed is unknown"),
-        speed => bail!("unsupported usb device speed {speed:?}"),
+        UsbSpeed::Low => Speed::Low,
+        UsbSpeed::Full => Speed::Full,
+        UsbSpeed::High => Speed::High,
+        UsbSpeed::Super | UsbSpeed::SuperPlus => Speed::Super,
+        _ => Speed::Unknown,
     }
 }
 
@@ -472,8 +482,10 @@ async fn get_descriptor(
     usb: &UsbDeviceHandle,
     descriptor_type: u8,
     descriptor_index: u8,
-    requested_length: u16,
+    requested_length: usize,
 ) -> anyhow::Result<Vec<u8>> {
+    let requested_length = u16::try_from(requested_length)
+        .context("usb descriptor length exceeds the GET_DESCRIPTOR request field")?;
     let pending = usb
         .get_descriptor(GetDescriptorRequest {
             recipient: Recipient::DEVICE,
